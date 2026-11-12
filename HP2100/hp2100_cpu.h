@@ -557,6 +557,34 @@ extern HP_WORD CIR;                             /* Central Interrupt Register */
 extern HP_WORD SPR;                             /* Stack Pointer Register (F-register for 2100) */
 
 
+/* L-Series processor ROM overlay (HP 02103-90009, Appendix A). */
+
+extern double cpu_l_io_time (void);
+extern t_bool l_asi_active (void);
+extern t_bool l_asi_any_active (void);
+extern t_bool l_asi_present (HP_WORD sc);
+extern t_bool l_asi_higher_irq (unsigned position);
+extern HP_WORD l_asi_irq_sc (void);
+extern void l_asi_sync (void);
+extern void l_asi_crs (void);
+extern void l_asi_mask (HP_WORD value);
+extern HP_WORD l_asi_mask_read (HP_WORD sc);
+extern HP_WORD l_asi_mode2 (HP_WORD sc, HP_WORD global, t_bool disabled);
+extern void l_asi_diagnose (uint32 mode, HP_WORD global, t_bool disabled);
+extern t_bool l_asi_irq (void);
+extern void l_asi_ack (HP_WORD sc);
+extern t_bool l_asi_slave (void);
+extern void l_asi_slave_ack (void);
+extern t_stat l_asi_poll (void);
+extern t_bool l_asi_io (HP_WORD instruction, HP_WORD global, t_bool disabled, HP_WORD *data, t_bool *skip);
+extern t_stat cpu_l_diag_configure (uint32 position, t_bool present, HP_WORD identity);
+extern t_bool cpu_l_protect (HP_WORD address, t_bool jump);
+extern t_bool cpu_l_rom_read (HP_WORD address, t_bool fetch, HP_WORD *value);
+extern void cpu_l_parity_write (uint32 address, HP_WORD value, t_bool console);
+extern void cpu_l_parity_read (uint32 address, HP_WORD value, t_bool fetch);
+extern t_bool cpu_l_dma_parity_error (uint32 address, HP_WORD value);
+
+
 /* CPU global state */
 
 extern DEVICE    cpu_dev;                       /* CPU device structure */
@@ -643,3 +671,10 @@ extern void   cpu_microcode_abort   (MICRO_ABORT abort_reason);
 /* I/O subsystem global utility routine declarations */
 
 extern uint32 io_poll_interrupts (FLIP_FLOP interrupt_system);
+
+/* L-Series 12009A HP-IB interface. */
+extern t_bool l_hpi_active (void), l_hpi_irq (void);
+extern void l_hpi_sync (void), l_hpi_crs (void), l_hpi_ack (void);
+extern void l_hpi_mask (HP_WORD value), l_hpi_diagnose (uint32 mode);
+extern HP_WORD l_hpi_mask_read (void), l_hpi_mode2 (HP_WORD global, t_bool disabled);
+extern t_bool l_hpi_io (HP_WORD instruction, HP_WORD global, t_bool disabled, HP_WORD *data, t_bool *skip);

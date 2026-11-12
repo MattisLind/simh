@@ -60,3 +60,8 @@ out/
 CMakeSettings.json
 ## Staging area for cmake install (default install prefix)
 SIMH-install
+
+# Local historical HP originals; retain the development plan in version control.
+/hp1000-references/manuals/
+/hp1000-references/software/
+/tests/hp1000/__pycache__/

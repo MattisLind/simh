@@ -377,9 +377,12 @@ switch ((IR >> 8) & 0377) {                             /* decode IR<15:8> */
     case 0211:                                          /* DST 104400 (OP_A) */
         reason = cpu_ops (OP_A, op);                    /* get operand */
 
+        if (reason == SCPE_OK && cpu_l_protect (op[0].word, FALSE))
+            break;                                     /* inhibit both writes before altering RAM */
         if (reason == SCPE_OK) {                        /* successful eval? */
             WriteW (op[0].word, AR);                    /* store AR */
-            WriteW ((op[0].word + 1) & LA_MASK, BR);    /* store BR */
+            if (! cpu_l_protect ((op[0].word + 1) & LA_MASK, FALSE))
+                WriteW ((op[0].word + 1) & LA_MASK, BR); /* check each destination, including wraparound */
             }
         break;
 

@@ -41,8 +41,10 @@
 
    Implementation notes:
 
-    1. Three CARD_ID values are defined, corresponding to the Amigo disc (DA),
-       CS/80 disc (DC), and Amigo mag tape (MA) simulators.  At first release,
+    1. The original CARD_ID values correspond to the Amigo disc (DA),
+       CS/80 disc (DC), and Amigo mag tape (MA) simulators.  An additional
+       lh ID connects the L-Series 7902/9895 endpoint to this shared bus.
+       At first release,
        only the DA device is implemented.  However, as the 12821A diagnostic
        requires two cards to test I/O fully, a dummy DC device is provided by
        the DA simulator.  It is enabled only when the DA card is configured for
@@ -57,9 +59,9 @@
 #define FIFO_SIZE       16                              /* FIFO depth */
 
 typedef enum {
-    da, dc, ma,                                         /* card IDs */
+    da, dc, ma, lh,                                    /* lh = L-Series floppy bus */                                         /* card IDs */
     first_card = da,                                    /* first card ID */
-    last_card  = ma,                                    /* last card ID */
+    last_card  = lh,                                    /* last card ID */
     card_count                                          /* count of card IDs */
     } CARD_ID;
 
@@ -260,3 +262,10 @@ extern RESPONDER da_bus_respond;
 
 extern ACCEPTOR  ma_bus_accept;
 extern RESPONDER ma_bus_respond;
+
+/* Optional L-Series 12009A frontend to the shared HP-IB bus. */
+extern t_bool l_hpi_owns (CARD_ID card);
+extern t_bool l_hpi_bus_accept (uint8 data);
+extern void l_hpi_bus_update (void);
+extern ACCEPTOR l_amigo_accept;
+extern RESPONDER l_amigo_respond;

@@ -340,6 +340,8 @@
 #define STOP_EOT            9                   /* end of tape */
 
 #define NOTE_INDINT         10                  /* an interrupt occurred while resolving an indirect address */
+#define STOP_L_UNSUPPORTED  11                  /* L-Series feature not yet emulated; not a hardware trap */
+#define NOTE_L_PROTECT     12                  /* L instruction inhibited by protection */
 
 
 /* Modifier validation identifiers */
@@ -838,6 +840,9 @@ typedef struct {                                /* bit set format descriptor */
      e = HP 1000 M-Series
      f = HP 1000 E-Series
      g = HP 1000 F-Series
+
+   The L-Series model uses previously unused bit 19.  Existing model and
+   firmware bit assignments are retained; CPU_1000 still means M/E/F only.
 */
 
 typedef enum {                                  /* CPU option identifiers */
@@ -859,7 +864,8 @@ typedef enum {                                  /* CPU option identifiers */
     Option_VMAOS,                               /*   RTE-6/VM VMA and OS firmware */
     Option_VIS,                                 /*   Vector Instruction Set firmware */
     Option_SIGNAL,                              /*   SIGNAL/1000 firmware */
-    Option_DS                                   /*   Distributed Systems firmware */
+    Option_DS,                                  /*   Distributed Systems firmware */
+    Option_1000_L                               /*   L-Series model bit; unit model code is separately encoded */
     } OPTION_ID;
 
 typedef enum {                                  /* CPU options currently installed */
@@ -870,6 +876,7 @@ typedef enum {                                  /* CPU options currently install
     CPU_1000_M = (1u << Option_1000_M),         /*   model 1000 M-Series CPU */
     CPU_1000_E = (1u << Option_1000_E),         /*   model 1000 E-Series CPU */
     CPU_1000_F = (1u << Option_1000_F),         /*   model 1000 F-Series CPU */
+    CPU_1000_L = (1u << Option_1000_L),         /*   model 1000 L-Series CPU (experimental subset) */
 
     CPU_BASE   = (1u << Option_BASE),           /*   Base Set firmware */
     CPU_EAU    = (1u << Option_EAU),            /*   Extended Arithmetic Unit hardware or firmware */
@@ -893,7 +900,7 @@ typedef enum {                                  /* CPU options currently install
 #define CPU_21XX            (CPU_2116 | CPU_2115 | CPU_2114 | CPU_2100)
 #define CPU_1000_E_F        (CPU_1000_E | CPU_1000_F)
 #define CPU_1000            (CPU_1000_M | CPU_1000_E | CPU_1000_F)
-#define CPU_ALL             (CPU_211X | CPU_2100 | CPU_1000)
+#define CPU_ALL             (CPU_211X | CPU_2100 | CPU_1000 | CPU_1000_L)
 
 #define CPU_MODEL_MASK      CPU_ALL             /* a mask for just the CPU model bits */
 #define CPU_OPTION_MASK     (~CPU_ALL)          /* a mask for just the option bits */
@@ -918,6 +925,7 @@ extern t_stat parse_sym  (CONST char *cptr, t_addr addr, UNIT *uptr, t_value *va
 
 /* System interface global SCP support routine declarations */
 
+extern t_bool l_asi_active (void);               /* optional L console owns keyboard when active */
 extern t_stat hp_attach   (UNIT *uptr, CONST char *cptr);
 extern t_stat hp_set_dib  (UNIT *uptr, int32 count, CONST char *cptr, void *desc);
 extern t_stat hp_show_dib (FILE *st, UNIT *uptr, int32 count, CONST void *desc);

@@ -1,0 +1,520 @@
+# Validation results — 10 November 2026
+
+| Check | Result | Scope |
+|---|---|---|
+| Forced HP2100 rebuild | PASS | Baseline commit; warnings-as-errors; optional wrong-architecture libpng warning |
+| Built-in RegisterSanityCheck | PASS | Existing HP2100 register definitions |
+| Existing model execution checks | PASS, 7/7 | 2114, 2115, 2116, 2100, 1000-M/E/F: load, add, store, exact HLT/P/T/A and memory assertions |
+| Binary decoder tests | PASS, 5/5 | Fixed known record, corruption, truncation, empty stream, original kernel/source anchor |
+| L kernel Rev.2001 format | PASS | 114 record checksums; 6,239 unique memory words |
+| L kernel Rev.2001 decoded load | PASS | All 6,239 words deposited and asserted in a 1000-E memory container; no execution |
+| L kernel Rev.2001 PTR bootstrap load | PASS | Existing 1000-E loader reaches HLT 77 at P=77712; 6,237 words match decoder; A/B excluded as loader scratch |
+| L kernel execution | NOT_IMPLEMENTED | Zero diagnostic tests executed; L CPU subset exists, but required CPU/I/O features are unfinished |
+
+## First integrated L-Series CPU subset
+
+`python3 tests/hp1000/run_l_series.py`: **48/48 independent checks PASS**.
+Model is `1000-L` in the existing HP2100 executable. No historical diagnostic
+or interface-card test is included in this count. Per-case identifiers, counts,
+and logs are recorded in `build/hp1000/l-series-results.json` and `l-series.log`.
+
+Coverage includes all fourteen memory-reference operations; addition carry,
+signed overflow, and sticky flags; equal/unequal compares; ISZ wrap; direct and
+indirect jumps/subroutine linkage; accumulator memory aliases; chained indirect
+and current-page addressing; page-boundary and PC-wrap behavior; NOP and
+simulator HLT; nonexistent-memory all-ones reads and ignored writes (checked
+after memory expansion); breakpoints and indirect-loop stops; unconditional
+refusal of unfinished instruction groups; rejected M/E/F options and boot ROMs;
+and switching back to an existing model with its normal memory semantics.
+
+The rebuilt simulator also passes RegisterSanityCheck, all seven original-model
+smoke checks, both original-image load checks, and the five decoder tests.
+The optional wrong-architecture libpng linker warning remains. L-Series kernel
+execution is still NOT_IMPLEMENTED; zero original diagnostic tests executed.
+
+## Original processor ROM execution increment
+
+The independent CPU suite now passes **55/55** checks, including shift/alter,
+multiply/divide, double load/store, and long shifts/rotates. Decoder/container
+unit tests pass **11/11**. All seven prior-model smoke checks and both original
+kernel image load checks remain passing.
+
+The PROM containers validate, and all 3,675 emitted words of 12001-18001
+Rev.2150 match the interleaved original lanes. Four-page ROM-routing tests pass.
+Authentic firmware startup completes the original CPU instruction-test prefix:
+156 instructions complete, then the 157th attempt stops at unfinished CLC 5,
+logical address 00416. Full power-on pretest and interactive VCP are not passed.
+Detailed scope, logs, and remaining gates are in `firmware.md` and
+`build/hp1000/firmware/firmware-results.json`.
+
+## Direct KERN execution probe
+
+Loaded unchanged `24397-16002_Rev-2001.abin` directly into the 1000-L model's
+RAM, checked all 114 record checksums, and asserted all 6,239 decoded words.
+The processor ROM overlay was disabled. Each entry ran in a separate fresh
+simulator, bounded to 10,000 instructions and 30 seconds.
+
+| Initial P (octal) | Observed path | Result |
+|---|---|---|
+| 00002 | JMP through location 3 to START at 03000; initialize restart vectors | Four instructions complete; fifth attempt stops at 03003, SFS 4 |
+| 03000 | Direct START entry | Three instructions complete; fourth attempt stops at 03003, SFS 4 |
+| 00004 | Initial NOP then parity trap cell at 5; enters illegal-interrupt handler | Four instructions complete; fifth attempt stops at 03254, LIA 4 |
+
+Source `24397-18002_Rev-2001.src` lines 95–102 call 4 the starting address,
+but the initial binary has NOP there. Lines 685–691 place START at ORG 3000B
+and overwrite both 2 and 4 with the restart jump. Thus 2 is the working boot
+entry, 3000 is the direct initial entry, and 4 becomes a restart after initialization.
+Octal 100 is not an identified initial entry.
+
+At the time of that initial probe, SC 4 power-status/CIR behavior was the blocker.
+KERN has now begun execution, but **zero diagnostic test sections have verified
+passes**. Earlier statements of no KERN execution describe the baseline before
+this probe. Reproduce with `python3 tests/hp1000/run_kernel.py`; evidence is in
+`build/hp1000/kernel/results.json` and the per-entry traces/logs.
+
+No pre-existing `HP2100/tests/` regression suite exists in this checkout. The
+seven execution checks are newly added smoke coverage, not a claim of full
+historical HP2100 diagnostic coverage. Machine-readable results and logs are
+in `build/hp1000/`, generated by `tests/hp1000/run_baseline.py`.
+
+## Select-code 4 implementation and KERN rerun
+
+Implemented L-specific power-status skips, six-bit CIR load/merge/output,
+Type 2/3 enable/disable state, and STF/CLF NOP behavior. Added 26 directed
+checks covering both power senses, A/B data operations, masking, control
+transitions, C modifiers, and NOP side effects. The L suite passes **81/81**.
+
+KERN now passes the previous SC 4 stops:
+
+| Initial P (octal) | New stop | Attempts |
+|---|---|---:|
+| 00002 | 03005: CLC 0,C | 6 (5 completed) |
+| 03000 | 03005: CLC 0,C | 5 (4 completed) |
+| 00004 | 03265: CLC 0,C, in the illegal-interrupt handler | 9 (8 completed) |
+
+SC 0 system reset is the next unfinished operation. No diagnostic section pass
+is claimed. Per-entry results and traces are regenerated under
+`build/hp1000/kernel/` by `run_kernel.py`.
+
+## Select-code 0 implementation and longer KERN probe
+
+CLC 0 and CLC 0,C now execute in the L-specific handler, alongside SC 4.
+Added STF/CLF, SFS/SFC (including test-before-clear), and STC 0 behavior.
+Eighteen directed checks distinguish CLC 0 from CLC 0,C and verify that CRS
+does not reset CPU state or the independent SC 4 enable gate. All **99 L CPU
+checks pass**, as do the existing-model smoke checks, two image-load checks,
+eleven unit tests, and firmware routing/startup-prefix checks.
+
+KERN no longer stops at 03005. Entry 2 runs through the checksum/initialization
+path into memory testing. The standard 10,000-instruction probe expires at
+03374 (entry 3000 reaches 03375); a separate entry-2 run bounded to 100,000
+instructions expires at 03520, SLA,ARS, in the address-parity pattern code.
+These budget stops are **UNKNOWN**, not diagnostic passes or failures. The
+uninitialized address-4 entry follows its error path and now stops at 03317,
+LIB 3,C (P SAVE/ROM P not implemented).
+
+Longer-probe artifacts are under `build/hp1000/kernel-sc0-100k/`. Reproduce:
+
+```sh
+python3 tests/hp1000/run_kernel.py --entry 2 --steps 100000 --output build/hp1000/kernel-sc0-100k
+```
+
+## Complete KERN word-memory phase: PASS
+
+Ran the unchanged KERN Rev.2001 binary in the 1000-L model with 32K words,
+ROM disabled, starting at octal 2. The complete word-memory phase returned
+through the final `JMP PEIT` and reached **03641**, the entry to the separate
+parity-error interrupt test. This is a verified diagnostic **subset pass**,
+not a full KERN pass.
+
+Source lines 734–783 drive the memory phase, and lines 955–1156 implement its
+address, complemented-address, fixed/checkerboard, worst-case, address-parity,
+and disturbance patterns. Source `PEIT` at line 1160 marks the next phase.
+Breakpoints guarded MERR, DSPLY, their relocated page-zero entries, and PRERR;
+none fired. The boundary signature was checked against the original binary,
+and completion required P=03641, IR=027641, FADD=020000, LADD=077777,
+and EOM=077777. The final range is 020000–077777; preceding passes cover the
+buffer, relocated diagnostic code and lower memory as specified by KERN.
+Reserved CPU/trap locations are handled by the diagnostic's own range choices;
+this does not claim that every physical bit or hardware parity path was tested.
+
+The formal run had a 50-million-instruction budget and 30-second wall limit,
+but reached completion in approximately 1.8 seconds. No full instruction trace
+was generated during the long phase. The next phase was then traced and stopped
+at **03647: CLC 5**, because SC 5 parity-system control is not implemented.
+
+```sh
+python3 tests/hp1000/run_kernel_memory.py
+```
+
+Results, exact image/source hashes, error breakpoints, completion conditions,
+simulator log and the parity-entry trace are under `build/hp1000/kernel-memory/`.
+No HP source/binary or emulator code was modified to obtain this result.
+
+## KERN parity-interrupt phase: PASS with software parity
+
+Unchanged Rev.2001 completes both word-memory and parity-interrupt phases and
+reaches 03777/TST01. The runner checks LPFAULT=513 (512 data faults plus one
+fetch fault), LPFETCH=1, LPAR=103710, odd sense and enabled detection, with
+error-handler breakpoints active. No diagnostic bypass or HP binary patch was
+used. See `parity.md` and `build/hp1000/kernel-parity-verified/results.json`.
+
+The next bounded CPU-test probe expires at 04367 and remains UNKNOWN. Full
+KERN is not passed. Independent parity checks pass 18/18; all prior 99 L
+checks, seven existing-model smoke checks, image-load checks, eleven unit tests
+and firmware-prefix checks also pass. Original ROM startup now reaches OTB 7,C
+at 00425 instead of CLC 5; its checked prefix has 164 attempts.
+
+## KERN instruction tests: blocked at JLA
+
+Direct entry at octal **03777 (TST01)** works with the unchanged absolute image
+loaded into a reset 32KW L-Series machine. A separate run through the complete
+memory and parity phases reaches the same stop, with identical P/A/B/E/O/IR.
+Thus those phases can be skipped for this instruction-test probe; this does not
+establish that later processor-I/O tests need no startup initialization.
+
+The checkpoint runner reaches TST02 (05777), TST03 (07777), TST04 (11777),
+and TSTJL (06362), in that order. CPERR, PRERR, MERR and DSPLY executable
+entries are guarded; none is reached. This covers the preceding test paths,
+including the arithmetic section before its explicit transfer back to TSTJL.
+It does not constitute a complete instruction-suite pass.
+
+Both runs stop at **06366, opcode 100600, JLA**, the first JLA in TSTJL.
+Registers: A=125252, B=077777, E=1, O=1. The simulator reports an unsupported
+L-Series feature; the diagnostic has not reported an instruction failure.
+The next word is the jump destination. TST05 (13777), the processor-I/O test
+boundary, is not reached. Implementing documented JLA/JLB semantics is the next
+step; neither the diagnostic image nor the emulator was patched for this run.
+
+```sh
+python3 tests/hp1000/run_kernel_instructions.py
+```
+
+Artifacts and original image/source hashes are recorded under
+`build/hp1000/kernel-instructions-verified/`. The earlier comparison scripts
+and logs are in `build/hp1000/kernel-instructions/`. The runner uses a
+100-million-instruction budget per checkpoint and a 30-second wall limit;
+unsupported stops and incomplete execution are distinct from a diagnostic pass.
+
+## KERN instruction tests after JLA/JLB implementation: PASS to TST05
+
+The preceding JLA stop is resolved. Canonical L-Series opcodes 100600/104600
+now use the EAU inline-address/indirect path, load A/B with the return address
+following the operand word, and jump to the resolved address without changing
+E/O or the other accumulator. This follows ERD 02103-90009 figure 2-8,
+sheets 1 and 2 (printed 2/34A-B, PDF pages 55–56), especially the JL* branch
+through state TT (32), and agrees with KERN's JAL1–JAL4 return-address constants.
+These instructions and their symbolic mnemonics apply only to the L-Series.
+
+The unchanged original instruction path from 03777 now reaches TST02, TST03,
+TST04, TSTJL and finally **TST05 at 13777**, without guarded error entry.
+This includes the original four JLA/JLB checks, followed by the extended ASG
+tests. The runner deliberately stops before TST05 executes: processor I/O and
+full KERN are not claimed to pass. Results are regenerated in
+`build/hp1000/kernel-instructions-verified/`.
+
+Directed L tests pass 107/107, including eight JLA/JLB cases for both flag
+states, indirect chains, and return-address wraparound; symbolic assembly is
+also exercised. Synthetic ROM routing checks cover both JL variants' inline
+operands and indirect pointers in each ROM page. All seven existing-model
+smoke tests, two original-image load checks, 18 parity checks, 11 unit tests,
+and authentic firmware-prefix checks pass. Build and whitespace checks pass.
+
+## Processor-I/O prefix: PASS; 13777 and 03777 entries match
+
+Implemented processor mask bit 1, global controls/address latch, status input,
+SC 7 register transfers, SC 6 timer/flag/interrupt behavior, and the Type 1
+unimplemented-instruction trap. See `io.md` for the manual evidence and limits.
+The unchanged Rev.2001 absolute image now passes IREGC, forced TBG service,
+timer-duration and masking checks, SC 4 gating, JSB trap-cell entry/return,
+and sixteen UI traps. It reaches MPTST and stops at **14246: STC 7**; memory
+protection enforcement remains explicitly unsupported. No error guard fires.
+
+Direct 13777 and 03777 runs have matching P/A/B/E/O/IR/CIR, processor mask,
+timer state and 260 timer ticks at this boundary. This validates direct entry
+for the tested prefix, not every subsequent diagnostic section. Full TST05,
+interface-card I/O/DMA and full KERN remain incomplete. Scripts, logs, source
+and image hashes, checkpoints and comparison JSON are reproducible with
+`python3 tests/hp1000/run_kernel_io.py` under `build/hp1000/kernel-io-verified/`.
+
+Independent processor-I/O checks pass 47/47. Existing 107 L checks, 18 parity
+checks, complete original KERN memory/parity phases, KERN instruction path,
+seven existing-model smoke checks, two original-image load checks, eleven unit
+tests, and authentic firmware-prefix/ROM routing checks pass. The firmware
+checkpoint now completes OTB 7,C and stops at 00426, with all 164 prefix
+instructions executed. Longer firmware startup remains unverified.
+
+## Memory-protection implementation
+
+STC 7 now enables actual L protection. The first original KERN HLT and I/O
+violations pass, with two protection requests and LVIO=14270/TH003. Both 13777
+and 03777 entries match at the next stop, **14311: LIA 3,C**, the unimplemented
+ROM-P register read in MPT02's select-code sweep. No error guard fires. This
+supersedes the earlier STC 7 stop; it is not a full protection-section pass.
+See `protection.md` for implementation, manual discrepancies and remaining
+coverage. Reproduce with `run_protection.py` and `run_kernel_io.py`.
+
+Protection validation passes 73/73 independent checks. Existing 47 processor-I/O,
+107 L CPU, 18 parity, seven existing-model smoke and two load checks also pass,
+as do original memory/parity phases, the instruction path, firmware prefix/ROM
+routing, eleven unit tests, the build and whitespace checks. Final entry
+comparison additionally asserts LMPFLT=2, LVIO=TH003 and LMPEN=0.
+
+## SC 3 register transfers
+
+Implemented independent 16-bit P-SAVE and ROM-P load/merge/output for A/B,
+selected by C, plus documented flag/control NOPs. Original VCP source confirms
+that ROM-P bit 15 must be retained as a single-cycle flag. CPU debug/save-state
+registers are LPSAVE/LROMP. See `sc3.md` for manual/source evidence and limits.
+
+Both original KERN entries pass the ROM-P read and next stop at **14311:
+LIA 10,C (103510)**. The location is unchanged because KERN patches the select
+code in place; the previous opcode was 103503. Prior protection checks still
+pass and final entry states match. Full KERN remains incomplete.
+
+The 74 independent I/O checks include 27 SC 3 cases. The existing firmware
+prefix remains valid, and a new bounded original reset probe reaches
+**00710/STC 11 (102711)**, checked against original PROM contents. Mapping
+controls, full pretest, slave transitions, CLC 3 single-step and interactive VCP
+remain unfinished. No diagnostic or firmware source/image was patched.
+
+## Provisional unassigned input: 177777
+
+Owner-authorized unassigned L input now returns all ones for LI/MI A/B, hold or
+clear, at otherwise unhandled SC 10–77. This is explicitly provisional; see
+`unassigned-io.md`. I/O checks pass 114/114, including 40 new cases. The guarded
+13777/03777 comparison now passes through the complete select-code sweep to
+14324/MPT03, with matching state. Later relocation overlaps error-breakpoint
+addresses, so the comparison ends before that overlap.
+
+A separate full memory/parity startup continuation reaches MPT09's genuine
+error at 15101 (CPERR return 15102), indicating missing interrupt recognition
+inside the three-level indirect chain. It is captured at CPERR entry outside
+the relocated range. Earlier 17666 breakpoint collision is not a diagnostic
+failure. Full KERN remains incomplete. See `build/hp1000/unassigned/` for the
+bounded script/log/classified result; the HP source and image remain unchanged.
+
+## KERN MPT09 indirect-chain interrupt checks: PASS
+
+Implemented L's built-in third-level Type 3 recognition, including instruction
+restart for longer chains and timer arrivals during resolution. The original
+fully initialized KERN now passes MPT09, including EXITM/EXITN return addresses.
+The next stop is **15212: OTA 2**, with A=1 selecting unimplemented diagnose
+mode 1. The earlier 15101 diagnostic error is resolved; full KERN is not passed.
+
+Nineteen directed checks pass, including 2116 with/without its MP board, and
+all existing CPU, I/O, protection, parity, firmware, load and unit regressions
+pass. The repeatable runner validates original startup, handles checkpoint
+collisions with relocated test code, and records original hashes. See
+`indirect-interrupts.md` and `build/hp1000/kernel-indirect/results.json`.
+
+## Diagnose mode 1: controller implemented; real backplane is empty
+
+Investigated 02103-90007 sections 5-23/5-24 and KERN CHIPS/GETSC/NOSC. Implemented
+mode-1 commands, priority enumeration, full identity return, exhaustion without
+changing the accumulator, direct ID queries without consuming priority, and
+GR-scoped control in a controller integrated into the L CPU path. No actual
+L card descriptions are registered by default.
+
+The fully initialized KERN now executes OTA 2 successfully and reaches IOERR at
+17710 from the original **no I/O chips responded** check. The runner verifies
+this exact source-derived error call and empty table, retaining full_KERN_pass
+false. It is a configuration limitation, not an unsupported mode-1 instruction.
+MPT09 remains PASS. A real interface driver is the next prerequisite; no HP
+source/image is patched and no device is invented to make enumeration succeed.
+
+57 instruction checks and shared-controller unit tests pass, with prior L,
+protection, I/O, parity, indirect and existing-model regressions passing. See
+`diagnose-mode-1.md` for supported semantics and remaining modes 2–7.
+
+## 12005A / VCP update (2026-11-11)
+
+The supplied 12005-90001 May 1981 reference manual and 02103-90005 November
+1984 I/O guide are now available; earlier missing-manual and no-interface
+statements above are superseded. The manuals folder currently contains 12 PDFs,
+including 12006, 12009A and later A/L diagnostic references; A-only material
+remains deferred. Local page counts and hashes are recorded in
+`build/hp1000/manuals/index.json`; OCR extracts for 12005, 12006 and the I/O
+guide are under the same directory.
+
+Authentic ROM pretests and interactive VCP now pass using the optional ASI
+interface, including register changes, single-step and run/halt return.
+Initialized KERN with ASI enumerates SC 20 and reaches TST06. Full KERN,
+normal serial DMA and diagnostic bootstrap remain unproven. See
+[12005a.md](12005a.md) for hardware references, test commands and limitations.
+
+## 12009A and original diagnostic-disc boot (2026-11-11)
+
+`run_hpi.py` passes seven grouped checks: card registers, card IRQ during
+indirection, packed DMA chains/residue, existing DA hard-drive identification,
+a byte-DMA write checked against the whole synthetic image, authentic RTE-L
+BOOTX and authentic HPIB diagnostic startup from 24397A.hpi. The latter prints
+its title and READY; running it passes its initial register/DMA checks but stops
+in the PHI chip tests, so no full diagnostic pass is claimed.
+
+The RTE-L BOOTX HLT 2 is a documented missing-SYSTEM checkpoint. The two XL
+masters likewise have no SYSTEM entry. Hardware bring-up continues separately
+from the unverified RTE-IVB/RTLGN generation route. See [12009a.md](12009a.md)
+and [rte-l-generation.md](rte-l-generation.md).
+
+## Complete original disk KRNL pass (2026-11-11)
+
+`python3 tests/hp1000/run_krnl_disk.py` now **passes** with ASI SC20 and HPI
+SC27 installed. Original VCP loads `KRNL` directly from read-only `24397A.hpi`.
+All 6,239 original absolute-image words match the disk file (Rev.2001), and no
+HP instructions or diagnostic data are patched. The runner executes the memory,
+CPU, processor I/O/protection, per-card I/O/DMA, and multiple-card tests, reaches
+original TST09 at **17770**, and executes its status write of **177777**.
+
+The source temporarily executes generated protection-test instructions at later
+code/error-handler addresses. The runner waits for the original CHIPS entry
+instruction to be restored before installing error breakpoints, avoiding false
+failures caused by those intentional probes. Completion requires TST09 and its
+status write; reaching an error handler cannot satisfy the test.
+
+Evidence: `build/hp1000/krnl-disk/results.json` and `krnl.log`.
+Disk SHA-256: `bee79f8ccd5acd501f67a14de79bfb4fac4a3176bf3286cab86b9fd78efb7dc1`.
+KRNL file SHA-256: `30a71bcaa22c71affaae3bee0961a1cc3e5154c7b0389f056278bacf877fe41a`.
+
+Corrections found by the unchanged diagnostic include diagnose-2 response routing
+and direct status reads with GR enabled, shared register readback, CRS resetting
+TBG/mask latches, unconditionally requested FLG22 interrupts, physical interrupt
+priority, four-word self-configuration, AUTO/residue/continuation, and card-side
+DMA parity errors. Mode-3 DMA uses bounded 32-word service slices with CPU
+progress between events; the backplane's 32-cycle CPUTURN limit informs the
+bound, but instruction-event pacing is a functional approximation, not a full
+microcycle model. Existing ASI/VCP and HPI bootstrap regressions remain separate.
+
+The next required gates are a second ASI with virtual loopback and the original
+ASIC diagnostic, followed by the original HPIB diagnostic. Further RTE-L bring-up
+is paused after the generated SYSTEM load checkpoint described in `rte-l-built.md`.
+
+## Original ASIC: second ASI and packed UART DMA
+
+The current sequence is RTE-L SYSTEM-load validation, full KRNL, ASIC, HPIB,
+then further RTE-L bring-up. The first two milestones are complete. The generated
+SYSTEM still boots through the unchanged VCP/BOOTX to kernel entry 02003, with
+31,742 loaded words checked; this is not yet a running RTE-L command environment.
+
+Full disk KRNL also passes with ASI SC20, HPI SC27 and ASI1 SC21 installed:
+`run_krnl_disk.py --second-asi`, completion 17770 and LSTATUS 177777. The disk and
+all 6,239 original KRNL absolute words remain unchanged.
+
+`python3 tests/hp1000/run_asic.py --instructions 120000000` boots the original
+ASIC from that same read-only disk through the original VCP. The disk ASIC SHA256
+is `2176712054ec309d3252619cdb70952f835bb974fcda8501a817ec1976cf26dc`.
+ASI1 supplies an independent virtual loopback; ASI remains the real firmware's
+console. No diagnostic instruction or data word is patched.
+
+ASIC now reaches the external baud-rate tests after its register, reset, break,
+seven/eight-bit, special-character recognition, packed/chained DMA,
+special-character termination/residue and break/overrun checks. It passes baud
+checks through 900 and starts 1200. This is **not a full ASIC pass**.
+
+At the current stall, TBG remains enabled with a pending flag, but INTSYS is zero.
+The original DDL PINT dispatcher has a nonzero pending-interrupt indication and
+no corresponding negative (pending) interrupt-table entry. Its SFS 0,C disables
+interrupts and its no-entry return does not restore them. The baud loop's INT 6
+handler assignment can overwrite a pending table entry retained from the previous
+iteration. This is a timing-sensitive interaction, not proof that the real hardware
+or original HP software is defective. Precise interrupt/DMA/UART timing needs
+further investigation; no simulator rule recognizes these diagnostic addresses
+or bypasses this state.
+
+The functional timer now shares a 50ns-unit time base with UART frame completion.
+ERD 02103-90009 table 2-2, printed 2-21 (PDF42), defines TBT+ as a CPU-chip output
+asserted each 10ms; the divider continues while SC6 gates interrupt requests.
+Stopping that divider when SC6 was disabled changed relative UART/timer phase.
+The corrected divider has a direct regression check. DMA bus-cycle timing and
+UART clock-edge phase remain approximate.
+
+The user confirms the working hood assumption TX–RX, RTS–CTS and DTR–DSR.
+Additional modem/baud-select connections are inferred from the original test;
+24397-90005 and the exact hood schematic are unavailable. HPIB full-diagnostic
+work and further OS bring-up remain paused until ASIC completes.
+
+## Original disk HPIB: PASS, including 7902 loopback
+
+The user deferred ASIC to allow HPIB work, then supplied the ASIC hood schematic
+and requested returning to ASIC after HPIB completion. The current order is
+therefore: KRNL (passed), HPIB (passed below), finish ASIC, then resume RTE-L.
+
+`run_hpib.py --instructions 30000000` reports full_HPIB_pass=true,
+interface_checks_pass=true and disk_loopback_pass=true. Original console:
+
+```
+ADDR. 0 IDENTIFIES WITH 000201 OCTAL
+DISC CONTROLLER LOOPBACK TEST ON HP-IB ADDR. 0
+PASS COMPLETE
+INPUT SELECT CODE
+```
+
+Original disk SHA256 remains
+`bee79f8ccd5acd501f67a14de79bfb4fac4a3176bf3286cab86b9fd78efb7dc1`;
+HPIB SHA256 is
+`7df6efa421a5a5d974c67dbc6f83df2dc50f3c4343394986a3e8396ba0995e34`.
+No program or disk patch is used. A prior interface-only PASS COMPLETE without
+a recognized disk was explicitly excluded from the full-pass criterion.
+Optional card-card testing was not run with this single HPI installation.
+
+See 12009a.md for the PHI/FIFO/DMA changes and remaining conformance limits.
+
+## Authentic ASIC Rev.2040: PASS with documented test hood
+
+After HPIB completed, the supplied 24612-90011 hood table/schematic was checked
+against 12005-90001 Figure 7-4. `ASI1 HOOD` now differs from a simple LOOPBACK:
+it includes the reference/baud/reset wiring, 1MHz external clock, SD modem status
+wraps and SSD receive-line fault injection.
+
+`python3 tests/hp1000/run_asic.py --revision 2040` passes every baud rate through
+9600, EXTERNAL CLOCK SOURCE TEST, BAUD RATE TEST COMPLETE and PASS COMPLETE.
+Results: `build/hp1000/asic-disk-rev2040/results.json`. This is the genuine
+24397-16005 Rev.2040 binary, not a patch of the disk's older ASIC. It is converted
+from checksum-verified absolute records to a memory file and appended as ASIC40
+to a working disk copy. The original VCP loads and executes it; existing original
+files and the source disk are unchanged.
+
+The older disk ASIC Rev.2001 is still a failing test. HP's supplied DDL source
+and binaries establish the cause: the old PINT no-entry path executes JMP PINT,I
+without undoing SFS0,C. Rev.2040 changes it to JMP PINTX, where STF0 restores
+interrupts before returning. This precisely matches the observed stale
+pending-indication/no-pending-table-entry stall. No emulator address check,
+instruction patch, or skipped baud test is used. See 12005a.md for the verified
+binary instruction addresses and hashes.
+
+Optional terminal/optical programs and two-card HP-IB testing remain outside this
+configuration. Full hardware conformance is not implied by these diagnostic passes.
+
+## First generated RTE-L execution beyond the loader
+
+After the diagnostic passes, continuing the generated SYSTEM shows an active
+kernel/console driver awaiting the HP2645 ENQ/ACK handshake. Its genuine DD.00
+source, 92070-18083 Rev.1941, explicitly sends ENQ and requests a one-byte ACK.
+Host input now schedules a waiting UART DMA transfer; a focused test checks that
+ACK reaches memory and completes the original input descriptor.
+
+With terminal ACK replies, the original kernel prints `*RTE-L SYSTEM READY*`.
+A SimH EXPECT rule can supply ACK only in response to ENQ; this is terminal-peer
+behavior, not synthetic OS output. The existing minimal build subsequently aborts
+COMND with OP17. EXEC's $OPXX path reports optional request support absent, and
+COMND issues class I/O while the build omitted the CLASS module/table. A genuine
+RTLGN rebuild including that optional subsystem is being investigated; a working
+command environment is not yet claimed.
+
+## Generated RTE-L command execution: PASS
+
+The final generation input now includes genuine `%CLASS`, sixteen class entries,
+and a 1024-word SAM allocation. RTLGN again reports zero errors. The boot runner
+uses the original VCP/BOOTX from a read-only 7902 copy, compares all 31,742 low
+memory words, supplies the documented HP2645 ENQ/ACK peer, reaches COMND and types
+TM. HP code prints the guest clock/date, then returns to idle ($XQT=0).
+
+`python3 tests/hp1000/run_rte_l_boot.py` reports kernel_ready=true,
+command_prompt=true and TM_completed=true. No original media or HP code is
+patched. A mistaken second-prompt test was removed after reading COMND's CALR
+source: the memory-based command program deliberately terminates after one
+interactive command. This is not an incomplete transmit/return indication.
+
+The earlier OP17/IO04 generation failures are resolved by the CLASS/SAM input
+changes, not emulator traps. Current hashes, reproduction and remaining
+installed-FMGR limits are in rte-l-built.md.

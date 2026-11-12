@@ -852,8 +852,17 @@ switch (classification) {                               /* dispatch on the acces
 
 index = map_address (address, map, protection);         /* translate the logical address to a physical address */
 
-if (index > 1 || map >= Port_A_Map)                     /* if memory is referenced or this is a DCPC transfer */
-    TR = (HP_WORD) M [index];                           /*   then return the physical memory value */
+/* L-Series nonexistent memory reads return all ones, unlike M/E/F.
+   HP 02103-90007, October 1980, section 3-7, printed page 3-3. */
+if (classification <= Data_User && cpu_l_rom_read (address, classification == Fetch, &TR))
+    ;                                                  /* processor PROM drives the data bus */
+else if (cpu_configuration & CPU_1000_L && index >= mem_size)
+    TR = D16_MASK;
+else if (index > 1 || map >= Port_A_Map)                /* physical memory or DCPC transfer */
+    { TR = (HP_WORD) M [index];                         /*   then return the physical memory value */
+      if (classification <= Data_User)
+          cpu_l_parity_read (index, TR, classification == Fetch);
+    }
 else                                                    /* otherwise */
     TR = ABREG [index];                                 /*   return the selected register value */
 
@@ -994,7 +1003,9 @@ if (index <= 1 && map <= User_Map)                      /* if the A/B register i
     ABREG [index] = value;                              /*   then write the value to the selected register */
 
 else if (index < mem_end)                               /* otherwise if the location is within defined memory */
-    M [index] = (MEMORY_WORD) value;                    /*   then write the value to memory */
+    { M [index] = (MEMORY_WORD) value;                  /*   then write the value to memory */
+      cpu_l_parity_write (index, value, FALSE);
+    }
 
 TR = value;                                             /* save the value just written */
 
@@ -1114,6 +1125,11 @@ void mem_zero (uint32 starting_address, uint32 fill_count)
 {
 memset (M + starting_address, 0,                        /* zero the words */
         fill_count * sizeof (MEMORY_WORD));             /*   in the specified memory range */
+if (cpu_configuration & CPU_1000_L) {
+    uint32 address;
+    for (address = starting_address; address < starting_address + fill_count && address < 32768; address++)
+        cpu_l_parity_write (address, 0, TRUE);
+    }
 
 return;
 }
@@ -1308,7 +1324,10 @@ if (address <= 1 && !(sim_switches & SIM_SW_REST))      /* if the address is 0 o
     ABREG [address] = value & DV_MASK;                  /*   then store into the A or B register */
 
 else if (address < mem_end)                             /* otherwise if the address is within defined memory */
-    M [address] = (MEMORY_WORD) value & DV_MASK;        /*   then store the value */
+    { M [address] = (MEMORY_WORD) value & DV_MASK;      /*   then store the value */
+      if (!(sim_switches & SIM_SW_REST))               /* RESTORE supplies saved parity bits separately */
+          cpu_l_parity_write (address, value, TRUE);
+    }
 
 return;
 }

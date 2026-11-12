@@ -309,11 +309,11 @@ DEVICE dc_dev = {
    by the diagnostic only.
 */
 
-extern DEVICE da_dev;
+extern DEVICE da_dev, hpi_dev;
 
-static DEVICE    *dptrs       [card_count] = { &da_dev,         &dc_dev, NULL };
-static ACCEPTOR  *bus_accept  [card_count] = { &da_bus_accept,  NULL,    NULL };
-static RESPONDER *bus_respond [card_count] = { &da_bus_respond, NULL,    NULL };
+static DEVICE    *dptrs       [card_count] = { &da_dev,         &dc_dev, NULL, &hpi_dev };
+static ACCEPTOR  *bus_accept  [card_count] = { &da_bus_accept,  NULL,    NULL, &l_amigo_accept };
+static RESPONDER *bus_respond [card_count] = { &da_bus_respond, NULL,    NULL, &l_amigo_respond };
 
 
 /* Global trace list */
@@ -1257,6 +1257,7 @@ return;
 
 static void di_bus_poll (CARD_ID card)
 {
+if (l_hpi_owns (card)) { l_hpi_bus_update (); return; }
 CARD_ID other;
 uint8   response;
 
@@ -1303,6 +1304,8 @@ static t_bool di_bus_accept (CARD_ID card, uint8 data)
 {
 tpprintf (dptrs [card], DEB_XFER, "HP-IB card %d accepted data %03o\n",
           card, data);
+
+if (l_hpi_owns (card)) return l_hpi_bus_accept (data);
 
 fifo_load (card, data, bus_access);                     /* load the data byte into the FIFO */
 update_state (card);                                    /*   and update the card state */
@@ -1431,6 +1434,7 @@ return;
 
 static void update_state (CARD_ID card)
 {
+if (l_hpi_owns (card)) { l_hpi_bus_update (); return; }
 DI_STATE * const di_card = &di [card];
 uint8 assert = 0;
 uint8 deny = 0;

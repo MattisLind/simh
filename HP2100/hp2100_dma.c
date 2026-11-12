@@ -763,6 +763,16 @@ return outbound;                                        /* return the outbound s
 
 void dma_configure (void)
 {
+/* The L-Series distributes DMA across its interface cards.  The existing
+   central DMA/DCPC devices must not be presented as L hardware. */
+if (cpu_configuration & CPU_1000_L) {
+    dma1_dev.flags |= DEV_DIS;
+    dma2_dev.flags |= DEV_DIS;
+    deassign_device (&dma1_dev);
+    deassign_device (&dma2_dev);
+    return;
+    }
+
 dma1_dev.flags &= ~DEV_DIS;                             /* enable DMA channel 1 */
 
 if (cpu_configuration & CPU_2114)                       /* if the current CPU is a 2114 */

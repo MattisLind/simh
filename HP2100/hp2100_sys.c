@@ -157,6 +157,9 @@ extern DEVICE pif_dev;                          /* Privileged Interrupt Fence */
 extern DEVICE ptp_dev;                          /* Paper Tape Punch */
 extern DEVICE ptr_dev;                          /* Paper Tape Reader */
 extern DEVICE tbg_dev;                          /* Time Base Generator */
+extern DEVICE hpi_dev;                          /* HP 12009A L-Series HP-IB interface */
+extern DEVICE asi_dev;                          /* HP 12005A L-Series serial interface */
+extern DEVICE asi1_dev;                         /* optional second HP 12005A */
 extern DEVICE tty_dev;                          /* Teleprinter */
 
 
@@ -873,6 +876,20 @@ static const OP_TABLE eag_ops = {               /* EAG opcodes, searched linearl
     { "RRR", 0101100u, opShift, 0177760u },
     { "SWP", 0101100u, opNone,  0177777u },     /* SWP is equivalent to RRR 16 */
 
+    { NULL }
+    };
+
+/* L-Series jump-and-link instructions share EAU operand addressing. */
+static const OP_DESC eag_l_desc = {
+    OP_LINEAR,
+    OP_SINGLE,
+    AB_UNUSED,
+    CPU_EAU | CPU_1000_L
+    };
+
+static const OP_TABLE eag_l_ops = {
+    { "JLA", 0100600u, opMA1I, 0177777u },
+    { "JLB", 0104600u, opMA1I, 0177777u },
     { NULL }
     };
 
@@ -1795,6 +1812,7 @@ static const PARSER_ENTRY parser_table [] = {   /* parser table array, searched 
     { &asg_udesc,      asg_uops      },
     { &iog_desc,       iog_ops       },
     { &eag_desc,       eag_ops       },
+    { &eag_l_desc,     eag_l_ops     },
     { &eag_ef_desc,    eag_ef_ops    },
     { &iop_2100_desc,  iop_2100_ops  },
     { &fp_desc,        fp_ops        },
@@ -1959,6 +1977,9 @@ DEVICE *sim_devices [] = {                      /* an array of pointers to the s
     &ptp_dev,                                   /*   2895 Paper Tape Punch */
     &ptr_dev,                                   /*   2748 Paper Tape Reader */
     &tbg_dev,                                   /*   Time Base Generator */
+    &hpi_dev,                                  /* optional L-Series HP-IB */
+    &asi_dev,                                  /* optional L-Series console */
+    &asi1_dev,                                 /* optional L-Series serial test card */
     &tty_dev,                                   /*   2752/2754 Teleprinter */
 
     &poll_dev,                                  /*   simulation console polling device */
@@ -1978,7 +1999,9 @@ const char *sim_stop_messages [SCPE_BASE] = {   /* an array of pointers to the s
     "Breakpoint",                               /*   STOP_BRKPNT */
     "Cable not connected to",                   /*   STOP_NOCONN */
     "No tape loaded in",                        /*   STOP_NOTAPE */
-    "End of tape on"                            /*   STOP_EOT    */
+    "End of tape on",                           /*   STOP_EOT */
+    "Indirect interrupt (internal)",            /*   NOTE_INDINT (not a simulator stop) */
+    "L-Series feature not yet emulated"          /*   STOP_L_UNSUPPORTED */
     };
 
 
@@ -2124,6 +2147,9 @@ LOADER_ARRAY boot = {                                   /* an array of two BOOT_
     { 000,       IBL_NA,  IBL_NA,  { 0 } },             /*   HP 21xx Loader */
     { IBL_START, IBL_DMA, IBL_FWA, { 0 } }              /*   HP 1000 Loader */
     };
+
+if (cpu_configuration & CPU_1000_L)                     /* these commands manipulate 21xx/M/E/F loaders */
+    return SCPE_NOFNC;                                  /* L ROM loading is not yet implemented */
 
 if (flag == 0) {                                        /* if this is a LOAD command */
     if (*cptr != '\0') {                                /*   then if a parameter follows */
@@ -3081,6 +3107,10 @@ else {                                                  /* otherwise this is a M
         status = fprint_instruction (ofile, addr, val,  /*   print as an EAG instruction */
                                      radix, eag_desc, eag_ops);
 
+        if (status == SCPE_ARG && cpu_configuration & CPU_1000_L)
+            status = fprint_instruction (ofile, addr, val,
+                                         radix, eag_l_desc, eag_l_ops);
+
         if (status == SCPE_ARG)                             /* if it's not an EAG opcode but the EAU is present */
             status = fprint_instruction (ofile, addr, val,  /*   then try as a 1000-E/F extension instruction */
                                          radix, eag_ef_desc, eag_ef_ops);
@@ -3603,6 +3633,7 @@ return;
 static t_bool fprint_stopped (FILE *st, t_stat reason)
 {
 DEVICE *dptr;
+HP_WORD rom_instruction;
 
 if (reason == STOP_HALT) {                              /* if this is a halt instruction stop */
     sim_eval [0] = (t_value) TR;                        /*   then save the opcode for display */
@@ -3619,6 +3650,13 @@ else if (cpu_ioerr_uptr) {                              /* otherwise if this is 
         fprintf (st, " the %s device", sim_dname (dptr));   /*   then report the device */
     else                                                    /* otherwise */
         fputs (" an unknown device", st);                   /*   report that the device is unknown */
+    }
+
+/* SCP normally obtains the following mnemonic from RAM.  While the L ROM
+   overlay is active that would display an unrelated RAM instruction. */
+if (cpu_l_rom_read (PR, TRUE, &rom_instruction)) {
+    fprintf (st, ", ROM P: %05o, opcode: %06o\n", PR, rom_instruction);
+    return FALSE;
     }
 
 return TRUE;                                            /* return TRUE to append the program counter */
@@ -5044,6 +5082,8 @@ uptr->wait = sim_rtcn_calb (POLL_RATE, TMR_POLL);       /* recalibrate */
 sim_activate (uptr, uptr->wait);                        /* reschedule the timer */
 
 cpu_speed = uptr->wait / POLL_PERIOD;                   /* calculate the current CPU speed multiplier */
+
+if (l_asi_active()) return l_asi_poll();
 
 if (tty_dev.flags & DEV_DIS) {                          /* if the TTY is disabled */
     status = sim_poll_kbd ();                           /*   then we must poll for a console interrupt */

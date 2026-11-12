@@ -938,6 +938,7 @@
 
 #include "hp2100_defs.h"
 #include "hp2100_cpu.h"
+#include "hp2100_l_diag.h"
 #include "hp2100_cpu_dmm.h"
 
 
@@ -1024,7 +1025,7 @@
      U = Extended Arithmetic Unit is present
 */
 
-#define UNIT_MODEL_SHIFT    (UNIT_V_UF + 0)     /* bits 0- 3: CPU model (OPTION_ID value) */
+#define UNIT_MODEL_SHIFT    (UNIT_V_UF + 0)     /* bits 0- 3: unit model code (L uses code 7) */
 #define UNIT_OPTION_SHIFT   (UNIT_V_UF + 4)     /* bits 4-15: CPU options installed */
 
 #define UNIT_MODEL_MASK     0000017u            /* model ID mask */
@@ -1048,6 +1049,10 @@
 #define UNIT_1000_E         (Option_1000_E << UNIT_MODEL_SHIFT)
 #define UNIT_1000_F         (Option_1000_F << UNIT_MODEL_SHIFT)
 
+/* Preserve existing model and option encodings.  Unit model code 7 is unused,
+   but configuration bit 7 already means CPU_BASE, so L uses its own high bit. */
+#define UNIT_1000_L         (7u << UNIT_MODEL_SHIFT)
+
 /* Unit options */
 
 #define UNIT_EAU            TO_UNIT_OPTION (Option_EAU)
@@ -1066,7 +1071,8 @@
 
 /* Unit conversions to CPU options */
 
-#define TO_CPU_MODEL(f)     (CPU_OPTION) (1u << UNIT_MODEL (f))
+#define TO_CPU_MODEL(f)     (UNIT_MODEL (f) == UNIT_MODEL (UNIT_1000_L) \
+                              ? CPU_1000_L : (CPU_OPTION) (1u << UNIT_MODEL (f)))
 #define TO_CPU_OPTION(f)    (CPU_OPTION) (UNIT_OPTION (f) << CPU_OPTION_SHIFT)
 
 /* "Pseudo-option" flags used only for option testing; never set into the UNIT structure */
@@ -1157,6 +1163,35 @@ static t_bool    mp_is_present    = FALSE;      /* TRUE if Memory Protect is pre
 static uint32    last_select_code = 0;          /* the last select code sent over the I/O backplane */
 static HP_WORD   saved_MR         = 0;          /* the M-register value between SCP commands */
 
+static MEMORY_WORD l_rom [4096] = { 0 };       /* four 1K-word processor PROM pages */
+static t_bool l_rom_loaded = FALSE;             /* image supplied by the user; never bundled */
+static uint32 l_rom_disable_delay = 0;          /* STC 2 allows the following ROM exit jump */
+static t_bool l_rom_enabled = FALSE;            /* CLC 2 / STC 2 ROM overlay control */
+static t_bool l_power_failing = FALSE;         /* processor power-warning input; FALSE means power up */
+static t_bool l_type23_enabled = TRUE;          /* SC 4 interrupt type 2/3 enable latch */
+static uint8 l_parity_bits [32768] = { 0 };     /* stored seventeenth bit for standard L RAM */
+static t_bool l_parity_even = FALSE;             /* SC 5 flag: 0 odd, 1 even */
+static t_bool l_parity_enabled = FALSE;          /* SC 5 control */
+static t_bool l_parity_pending = FALSE;          /* unmaskable memory parity request */
+static uint32 l_parity_faults = 0;             /* observed RAM parity errors */
+static uint32 l_parity_fetch_faults = 0;       /* subset detected on instruction fetch */
+static HP_WORD l_parity_register = 0;            /* address, plus bit 15 for instruction fetch */
+static HP_WORD l_mask = 0;                     /* processor holds the TBG mask bit (bit 1) */
+static HP_WORD l_global = 0;                   /* global-address bus latch */
+static t_bool l_global_disabled = TRUE;
+static HP_WORD l_fence = 0, l_violation = 0;    /* SC 7 fence and violation address */
+static t_bool l_protect_enabled = FALSE, l_protect_pending = FALSE;
+static uint32 l_protect_faults = 0;
+static t_bool l_tbg_enabled = FALSE, l_tbg_flag = FALSE;
+static uint32 l_tbg_phase = 0;                 /* elapsed 50 ns units, modulo 10 ms */
+static uint32 l_tbg_ticks = 0;
+static t_bool l_unimplemented_pending = FALSE; /* Type 1 trap at octal 10 */
+static HP_WORD l_diagnose_mode = 0;
+static uint32 l_slave_delay = 0;
+static L_DIAG l_diagnose = { 0 };            /* populated only by real L card drivers */
+static HP_WORD l_vcp_psave = 0, l_vcp_romp = 0; /* SC 3 I/O-chip registers, including firmware flag bits */
+static HP_WORD l_status = 0;                    /* processor output register; page select bits 8:7 */
+
 static DEVICE    *loader_rom [4]  = { NULL };   /* the four boot loader ROM sockets in a 1000 CPU */
 
 
@@ -1179,7 +1214,7 @@ typedef struct {                                /* CPU model feature table */
     uint32      maxmem;                         /*   maximum configurable memory in 16-bit words */
     } FEATURE_TABLE;
 
-static const FEATURE_TABLE cpu_features [] = {          /* CPU features indexed by OPTION_ID */
+static const FEATURE_TABLE cpu_features [] = {          /* CPU features indexed by unit model code */
   { UNIT_DMA | UNIT_MP,                                 /*   Option_2116 */
     UNIT_PFAIL | UNIT_DMA | UNIT_MP | UNIT_EAU,
     32 * 1024
@@ -1217,6 +1252,11 @@ static const FEATURE_TABLE cpu_features [] = {          /* CPU features indexed 
     UNIT_PFAIL | UNIT_DMA | UNIT_MP     | UNIT_DMS |
     UNIT_VIS   | UNIT_DS  | UNIT_SIGNAL | UNIT_EMA_VMA,
     1024 * 1024
+    },
+
+  { UNIT_EAU,                                          /*   L-Series standard integer/EAU instructions */
+    0,                                                 /*   no M/E/F firmware or backplane options */
+    32 * 1024                                          /*   standard L; XL expansion is not emulated */
     }
   };
 
@@ -1236,6 +1276,10 @@ static t_stat cpu_boot  (int32  unitno, DEVICE *dptr);
 static t_stat set_stops    (UNIT *uptr, int32 option,    CONST char *cptr, void *desc);
 static t_stat set_size     (UNIT *uptr, int32 new_size,  CONST char *cptr, void *desc);
 static t_stat set_model    (UNIT *uptr, int32 new_model, CONST char *cptr, void *desc);
+static t_stat set_lrom     (UNIT *uptr, int32 value, CONST char *cptr, void *desc);
+static t_stat l_iog        (HP_WORD instruction);
+static t_bool l_tbg_request (void);
+static void l_tbg_advance (uint32 elapsed);
 static t_stat set_option   (UNIT *uptr, int32 option,    CONST char *cptr, void *desc);
 static t_stat clear_option (UNIT *uptr, int32 option,    CONST char *cptr, void *desc);
 static t_stat set_loader   (UNIT *uptr, int32 enable,    CONST char *cptr, void *desc);
@@ -1333,6 +1377,43 @@ static REG cpu_reg [] = {
     { FLDATA (O,       O,                                   0)                                          },
     { ORDATA (CIR,     CIR,                         6)                                                  },
 
+    { FLDATA (LUIIRQ, l_unimplemented_pending,              0),                       REG_RO            },
+    { ORDATA (LIMASK, l_mask,                      16)                                                  },
+    { ORDATA (LGR,    l_global,                     6)                                                  },
+    { FLDATA (LGRDIS, l_global_disabled,                    0)                                          },
+    { FLDATA (LMPEN, l_protect_enabled,                     0)                                          },
+    { FLDATA (LMPIRQ,l_protect_pending,                     0),                       REG_RO            },
+    { DRDATA (LMPFLT,l_protect_faults,                     32),                       REG_RO            },
+    { ORDATA (LDIAG, l_diagnose_mode, 3) },
+    { DRDATA (LSLAVE, l_slave_delay, 3) },
+    { FLDATA (LDIAG1, l_diagnose.active,                     0)                                          },
+    { BRDATA (LDID, l_diagnose.identity, 8, 16, L_DIAG_SLOTS), REG_HRO },
+    { BRDATA (LDINST, l_diagnose.present, 8, 1, L_DIAG_SLOTS), REG_HRO },
+    { BRDATA (LDPART, l_diagnose.participant, 8, 1, L_DIAG_SLOTS), REG_HRO },
+    { BRDATA (LDSEEN, l_diagnose.responded, 8, 1, L_DIAG_SLOTS), REG_HRO },
+    { ORDATA (LPSAVE, l_vcp_psave,                 16)                                                  },
+    { ORDATA (LROMP,  l_vcp_romp,                  16)                                                  },
+    { ORDATA (LFENCE, l_fence,                     15)                                                  },
+    { ORDATA (LVIO,   l_violation,                 15)                                                  },
+    { FLDATA (LTBGEN, l_tbg_enabled,                        0)                                          },
+    { FLDATA (LTBGFL, l_tbg_flag,                           0)                                          },
+    { DRDATA (LTBGPHS,l_tbg_phase,                 32)                                                  },
+    { DRDATA (LTBGTIK,l_tbg_ticks,                 32),                       REG_RO                    },
+    { FLDATA (LPAREN,  l_parity_enabled,                    0)                                          },
+    { FLDATA (LPAREVEN,l_parity_even,                       0)                                          },
+    { FLDATA (LPARIRQ, l_parity_pending,                    0),                       REG_RO            },
+    { DRDATA (LPFAULT, l_parity_faults,            32),                       REG_RO            },
+    { DRDATA (LPFETCH, l_parity_fetch_faults,      32),                       REG_RO            },
+    { ORDATA (LPAR,    l_parity_register,          16)                                                  },
+    { BRDATA (LPBITS,  l_parity_bits,        8,     1,             32768),             REG_HRO           },
+    { FLDATA (LPFAIL,  l_power_failing,                     0)                                          },
+    { FLDATA (LINT23,  l_type23_enabled,                     0)                                          },
+    { DRDATA (LROMDLY, l_rom_disable_delay, 2) },
+    { FLDATA (LROMEN,  l_rom_enabled,                       0)                                          },
+    { FLDATA (LROMLD,  l_rom_loaded,                        0),                       REG_RO            },
+    { ORDATA (LSTATUS, l_status,                   16)                                                  },
+    { BRDATA (LROM,    l_rom,                8,    16,              4096),             REG_HRO           },
+
     { FLDATA (INTSYS,  interrupt_system,                    0)                                          },
     { FLDATA (INTEN,   cpu_interrupt_enable,                0)                                          },
 
@@ -1396,6 +1477,8 @@ static MTAB cpu_mod [] = {
     { UNIT_MODEL_FIELD, UNIT_1000_F, "",           "1000-F",     &set_model,    &show_model, (void *) "1000-F" },
 #endif
 
+    { UNIT_MODEL_FIELD, UNIT_1000_L, "",           "1000-L",     &set_model,    &show_model, (void *) "1000-L" },
+
     { UNIT_MODEL_FIELD, UNIT_1000_M, NULL,         "21MX-M",     &set_model,    &show_model, (void *) "1000-M" },
     { UNIT_MODEL_FIELD, UNIT_1000_E, NULL,         "21MX-E",     &set_model,    &show_model, (void *) "1000-E" },
 
@@ -1452,6 +1535,8 @@ static MTAB cpu_mod [] = {
     { MTAB_XDV,                 0,      "IDLE",       "IDLE",          &sim_set_idle, &sim_show_idle, NULL       },
     { MTAB_XDV,                 0,      NULL,         "NOIDLE",        &sim_clr_idle, NULL,           NULL       },
 
+    { MTAB_XDV | MTAB_NC | MTAB_QUOTE, 0, NULL,         "LROM",          &set_lrom,     NULL,           NULL       },
+
     { MTAB_XDV,                 1,      NULL,         "LOADERENABLE",  &set_loader,   NULL,           NULL       },
     { MTAB_XDV,                 0,      NULL,         "LOADERDISABLE", &set_loader,   NULL,           NULL       },
 
@@ -1486,6 +1571,7 @@ static MTAB cpu_mod [] = {
 /* Trace list */
 
 static DEBTAB cpu_deb [] = {
+    { "IOBUS", TRACE_IOBUS },                   /* L processor/interface I/O */
     { "INSTR", TRACE_INSTR },                   /* trace instruction executions */
     { "DATA",  TRACE_DATA  },                   /* trace memory data accesses */
     { "FETCH", TRACE_FETCH },                   /* trace memory instruction fetches */
@@ -2006,10 +2092,17 @@ else                                                    /* otherwise */
 
 sim_switches &= ~SWMASK ('P');                          /* clear the power-on switch to prevent interference */
 
-if (initialize_io (TRUE) == FALSE)                      /* set up the I/O table; if there's a select code conflict */
+if (!(cpu_configuration & CPU_1000_L)
+  && initialize_io (TRUE) == FALSE)                      /* set up the I/O table; if there's a select code conflict */
     return SCPE_STOP;                                   /*   then inhibit execution */
 
+l_asi_sync (); l_hpi_sync ();                                       /* register only enabled L interfaces */
 mp_is_present = mp_initialize ();                       /* set up memory protect */
+
+/* The L backplane and traps are not yet emulated.  Do not recognize requests
+   left by another model, including requests during indirect resolution. */
+if (cpu_configuration & CPU_1000_L)
+    interrupt_request = 0;
 
 exec_save = 0;                                          /* clear the EXEC match */
 idle_save = 0;                                          /*   and idle match trace flags */
@@ -2060,14 +2153,82 @@ while (status == SCPE_OK) {                             /* execute until simulat
             break;                                      /*   then stop execution */
         }
 
-    if (dma_request_set) {                              /* if a DMA service request is pending */
+    if (!(cpu_configuration & CPU_1000_L) && dma_request_set) { /* conventional DMA is not an L backplane */
         dma_service ();                                 /*   then service the active channel(s) */
 
         if (dma_request_set)                            /* if a DMA request is still pending */
             continue;                                   /*   then service it before instruction execution */
         }
 
-    if (interrupt_request                                       /* if an interrupt request is pending */
+    /* Slave handoff is inter-instruction and inhibited while ROM executes.
+       02103-90005 section 2-6; original ROM entry is common to all four pages. */
+    if (cpu_configuration & CPU_1000_L && l_asi_slave () && !l_rom_enabled && l_rom_loaded) {
+        l_vcp_psave = PR;
+        PR = l_vcp_romp & LA_MASK;
+        l_rom_enabled = TRUE;
+        cpu_interrupt_enable = CLEAR;
+        l_asi_slave_ack ();
+        }
+
+    /* L parity is Type 1: independent of both Type 3 and SC 4 gating.
+       Acknowledge without touching any legacy backplane interface. The
+       trap-cell instruction executes with P still pointing after the fault. */
+    if (cpu_configuration & CPU_1000_L && l_parity_pending) {
+        CIR = 5;
+        l_parity_pending = FALSE;
+        l_parity_enabled = FALSE;                       /* original KERN/ROM re-enable after service */
+        interrupt_acknowledge = TRUE;
+        cpu_interrupt_enable = CLEAR;
+        tprintf (cpu_dev, TRACE_DATA, "L parity interrupt: address %06o, return P %05o\n",
+                 l_parity_register, PR);
+        IR = ReadF (5);
+        }
+
+    /* Unrecognized CPU instructions are Type 1, ahead of types 2/3 and
+       independent of their enables (02103-90007 section 4-4). */
+    else if (cpu_configuration & CPU_1000_L && l_unimplemented_pending) {
+        CIR = 010;
+        l_unimplemented_pending = FALSE;
+        interrupt_acknowledge = TRUE;
+        cpu_interrupt_enable = CLEAR;
+        IR = ReadF (010);
+        }
+
+    /* Memory protect is Type 2: independent of STF/CLF 0 and temporary
+       I/O deferral, but subject to the SC 4 master gate. */
+    else if (cpu_configuration & CPU_1000_L && l_protect_pending && l_type23_enabled) {
+        CIR = 7;
+        l_protect_pending = FALSE;
+        interrupt_acknowledge = TRUE;
+        cpu_interrupt_enable = CLEAR;
+        IR = ReadF (7);
+        }
+
+    /* TBG is Type 3, masked by processor mask bit 1. Every I/O instruction
+       and indirect jump defers Type 3 through the following instruction.
+       02103-90007 sections 4-5/4-7 and 4-11. IAK clears its request latch. */
+    else if (cpu_configuration & CPU_1000_L && l_tbg_request () && cpu_interrupt_enable) {
+        CIR = 6;
+        l_tbg_flag = FALSE;
+        interrupt_acknowledge = TRUE;
+        cpu_interrupt_enable = CLEAR;
+        IR = ReadF (6);
+        }
+
+    else if (cpu_configuration & CPU_1000_L && (l_asi_irq () || l_hpi_irq ())
+      && interrupt_system && l_type23_enabled && cpu_interrupt_enable) {
+        CIR = l_asi_higher_irq (1) ? l_asi_irq_sc () : l_hpi_irq () ? 027 : l_asi_irq_sc ();
+        if (CIR == 027) l_hpi_ack (); else l_asi_ack (CIR);
+        /* I/O chip accepts an interrupt with GR enabled and loaded with SC. */
+        l_global = CIR;
+        l_global_disabled = FALSE;
+        interrupt_acknowledge = TRUE;
+        cpu_interrupt_enable = CLEAR;
+        IR = ReadF (CIR);
+        }
+
+    else if (!(cpu_configuration & CPU_1000_L)
+      && interrupt_request                                     /* if an interrupt request is pending */
       && (cpu_interrupt_enable || reenable_interrupts ())) {    /*   and is enabled or reenabled */
         if (sim_brk_summ                                        /*     then if any breakpoints are defined */
           && sim_brk_test (interrupt_request,                   /*       and an unconditional breakpoint */
@@ -2112,6 +2273,10 @@ while (status == SCPE_OK) {                             /* execute until simulat
             }
 
         IR = ReadF (PR);                                /* fetch the instruction */
+        /* A bad L instruction is inhibited, not executed (02103-90007 4-2).
+           Keep its address in LPAR; service the request at the next boundary. */
+        if (cpu_configuration & CPU_1000_L && l_parity_pending)
+            IR = SRG_NOP;
         PR = PR + 1 & LA_MASK;                          /*   and point at the next memory location */
 
         cpu_interrupt_enable = SET;                     /* enable interrupts */
@@ -2159,6 +2324,11 @@ while (status == SCPE_OK) {                             /* execute until simulat
         }
 
 
+    /* Any acknowledged non-I/O trap instruction disables L protection.
+       An I/O instruction in a trap cell executes with protection retained. */
+    if (cpu_configuration & CPU_1000_L && interrupt_acknowledge && ! IOGOP (IR))
+        l_protect_enabled = FALSE;
+
     sim_interval = sim_interval - 1;                    /* count the instruction */
 
     status = machine_instruction (interrupt_acknowledge,    /* execute one machine instruction */
@@ -2169,6 +2339,47 @@ while (status == SCPE_OK) {                             /* execute until simulat
         status = SCPE_OK;                               /*     to service the interrupt */
         }
 
+    /* Functional standard-L timer: documented instruction times in 50 ns
+       units (02103-90007 table 3-5). DMA and data-dependent DIV timing are
+       not cycle-accurate. The timer advances only during CPU execution. */
+    if (cpu_configuration & CPU_1000_L && status == SCPE_OK) {
+        uint32 elapsed = 72;                            /* ASG: 3.6 us */
+        t_bool skipped = PR == ((err_PR + 2) & LA_MASK);
+        if (MRGOP (IR)) {
+            switch (IR & 0074000u) {
+                case 0024000u: elapsed = 54; break;     /* JMP */
+                case 0014000u:                         /* JSB */
+                case 0060000u: case 0064000u:
+                case 0070000u: case 0074000u: elapsed = 82; break;
+                case 0034000u: elapsed = skipped ? 128 : 118; break;
+                case 0050000u: case 0054000u: elapsed = skipped ? 100 : 90; break;
+                default: elapsed = 90; break;
+                }
+            }
+        else if (SRGOP (IR)) elapsed = 64;
+        else if (IOGOP (IR)) {
+            uint32 operation = IR >> 6 & 7;
+            elapsed = operation >= 4 && operation <= 6 ? 128 : 72;
+            if ((operation == 2 || operation == 3) && skipped) elapsed = 100;
+            }
+        else if (! ASGOP (IR)) elapsed = 662;                            /* conservative EAU bound, not exact */
+        l_tbg_advance (elapsed);
+        }
+
+    if (status == NOTE_L_PROTECT)
+        status = SCPE_OK;                               /* service the pending violation at the boundary */
+
+    if (cpu_configuration & CPU_1000_L && l_rom_disable_delay && status == SCPE_OK)
+        if (--l_rom_disable_delay == 0) l_rom_enabled = FALSE;
+
+    if (cpu_configuration & CPU_1000_L && l_slave_delay && status == SCPE_OK) {
+        if (--l_slave_delay == 0 && !l_rom_enabled && l_rom_loaded && l_asi_active ()) {
+            l_vcp_psave = PR;
+            PR = l_vcp_romp & LA_MASK;
+            l_rom_enabled = TRUE;
+            cpu_interrupt_enable = CLEAR;
+            }
+        }
     cpu_ss_inhibit = status;                            /* clear the simulation stop inhibition mask */
     }                                                   /*   and continue the instruction execution loop */
 
@@ -2194,7 +2405,7 @@ saved_MR = MR;                                          /* save the current M va
 if (status == STOP_HALT)                                /* if this is a programmed halt */
     set_loader (NULL, FALSE, NULL, NULL);               /*   then disable the 21xx loader */
 
-else if (status <= STOP_RERUN)                          /* otherwise if this is a simulation stop */
+else if (status <= STOP_RERUN || status == STOP_L_UNSUPPORTED) /* reexecute after a recoverable stop */
     PR = err_PR;                                        /*   then restore P to reexecute the instruction */
 
 meu_update_status ();                                   /* update the MEM status register */
@@ -2429,27 +2640,39 @@ uint32 level;
 t_bool pending;
 
 if (MR & IR_IND) {                                      /* if the address is indirect */
+    if (cpu_configuration & CPU_1000_L) l_tbg_advance (36);
     MR = ReadW (MR & LA_MASK);                          /*   then follow the chain (first level) */
 
     if (MR & IR_IND) {                                  /* if the address is still indirect */
-        pending = interruptible && interrupt_request;   /*   then see if an interrupt request is pending */
+        if (cpu_configuration & CPU_1000_L)
+            pending = interruptible && (l_tbg_request () || (interrupt_system && l_type23_enabled && (l_asi_irq () || l_hpi_irq ())));
+        else
+            pending = interruptible && interrupt_request;
 
         if (pending && cpu_interrupt_enable)            /* if it's pending and enabled */
             return NOTE_INDINT;                         /*   then service the interrupt now */
         else                                            /* otherwise */
-            pending = pending && mp_is_present;         /*   a pending interrupt is recognized only if MP is present */
+            pending = pending && (mp_is_present || cpu_configuration & CPU_1000_L);
+                                                       /* L has the interruptible-chain facility built in */
 
         for (level = 2; MR & IR_IND; level++) {         /* follow the chain from level 2 until the address is direct */
             if (level > indirect_limit)                 /* if the limit is exceeded */
                 return STOP_INDIR;                      /*   then stop the simulator */
 
-            else if (pending)                           /* otherwise if an interrupt is pending */
+            if (cpu_configuration & CPU_1000_L)
+                pending = interruptible && (l_tbg_request () || (interrupt_system && l_type23_enabled && (l_asi_irq () || l_hpi_irq ()))); /* may have arrived during a pointer read */
+
+            if (pending)                                /* otherwise if an interrupt is pending */
                 if (level == 3)                         /*   then if this is the third level */
                     cpu_interrupt_enable = SET;         /*     then reenable interrupts */
-                else if (level == 4)                    /*   otherwise if this is the fourth level */
+                else if (level == 4 || (cpu_configuration & CPU_1000_L && level > 4))
                     return NOTE_INDINT;                 /*     then service the interrupt now */
 
+            if (cpu_configuration & CPU_1000_L) l_tbg_advance (36);
             MR = ReadW (MR & LA_MASK);                  /* follow the address chain */
+            if (cpu_configuration & CPU_1000_L && level >= 3
+              && interruptible && (l_tbg_request () || (interrupt_system && l_type23_enabled && (l_asi_irq () || l_hpi_irq ()))))
+                cpu_interrupt_enable = SET;            /* recognize even a final third-level read */
             }
         }
     }
@@ -2571,6 +2794,9 @@ uint32      index, loader_start, ptr_sc;
 MEMORY_WORD loader [IBL_SIZE];
 MEMORY_WORD word;
 DEVICE      *ptr_dptr;
+
+if (cpu_configuration & CPU_1000_L)                     /* M/E/F and 21xx loaders are not L ROMs */
+    return 0;
 
 if (boot [is_1000].start_index == IBL_NA)               /* if the bootstrap is not defined for the current CPU */
     return 0;                                           /*   then reject the command */
@@ -3161,7 +3387,8 @@ while (working_set) {                                   /* while signals remain 
         case ioPON:                                     /* Power On Normal */
             AR = 0;                                     /* clear A register */
             BR = 0;                                     /* clear B register */
-            SR = 0;                                     /* clear S register */
+            if (!(cpu_configuration & CPU_1000_L))
+                SR = 0;                                 /* L S models fixed processor switches */
             TR = 0;                                     /* clear T register */
             E = 1;                                      /* set E register */
 
@@ -3545,6 +3772,33 @@ if (sim_switches & SWMASK ('P'))                        /* if this is a power-on
 else                                                    /* otherwise */
     io_assert (&cpu_dev, ioa_POPIO);                    /*   issue a PRESET */
 
+/* The CPU-chip electrical bus test precedes firmware and is not simulated.
+   The listing's first software entry is offset 2, not its data words 0/1.
+   HP 02103-90009 Appendix A-3/A-4; 12001-18001 lines 85-90. */
+if (cpu_configuration & CPU_1000_L && sim_switches & SWMASK ('P')) {
+    l_status = 0;
+    l_mask = l_global = l_fence = l_violation = 0;
+    l_protect_enabled = l_protect_pending = FALSE;
+    l_protect_faults = 0;
+    l_vcp_psave = l_vcp_romp = 0;
+    l_diag_reset (&l_diagnose);
+    l_diagnose_mode = 0; l_slave_delay = 0;
+    l_global_disabled = TRUE;
+    l_tbg_enabled = l_tbg_flag = FALSE;
+    l_tbg_phase = l_tbg_ticks = 0;
+    l_unimplemented_pending = FALSE;
+    l_parity_enabled = l_parity_pending = l_parity_even = FALSE;
+    l_parity_register = 0;
+    l_parity_faults = l_parity_fetch_faults = 0;
+    l_power_failing = FALSE;
+    l_type23_enabled = TRUE;
+    CIR = 0;
+    l_rom_enabled = l_rom_loaded;
+    l_rom_disable_delay = 0;
+    if (l_rom_loaded)
+        PR = 2;
+    }
+
 sim_brk_dflt = SWMASK ('N');                            /* the default breakpoint type is "nomap" as MEM is disabled */
 
 return SCPE_OK;
@@ -3596,6 +3850,15 @@ static t_stat cpu_boot (int32 unitno, DEVICE *dptr)
 {
 const int32 select_code = IBL_SC  (SR);                 /* the select code from S register bits 11-6 */
 const int32 rom_socket  = IBL_ROM (SR);                 /* the ROM socket number from S register bits 15-14 */
+
+if (cpu_configuration & CPU_1000_L) {
+    if (! l_rom_loaded)
+        return SCPE_NOFNC;
+    l_status = 0;
+    l_rom_enabled = TRUE;
+    PR = 2;                                            /* original software pretest entry */
+    return SCPE_OK;
+    }
 
 if (cpu_configuration & CPU_1000)                       /* if this is a 1000-series CPU */
     if (select_code < SC_VAR) {                         /*   then if the select code is invalid */
@@ -3749,7 +4012,7 @@ if (!(sim_switches & SWMASK ('F'))                      /* if truncation is not 
   && get_yn (confirm, FALSE) == FALSE)                  /*     and the user denies confirmation */
     return SCPE_INCOMP;                                 /*       then abort the command */
 
-if (cpu_configuration & CPU_1000)                       /* if the CPU is a 1000-series machine */
+if (cpu_configuration & (CPU_1000 | CPU_1000_L))        /* no 21xx protected-loader window */
     cpu_unit [0].capac = mem_size = mem_end = new_size; /*   then memory is not reserved for the loader */
 
 else {                                                  /* otherwise */
@@ -3843,6 +4106,36 @@ if (result == SCPE_OK) {                                /* if the change succeed
         mem_end = mem_size;                             /* memory is not reserved for the loader  */
         }
 
+    else if (cpu_configuration & CPU_1000_L) {          /* L has no 21xx protected-loader window */
+        is_1000 = FALSE;                               /* this index still means M/E/F only */
+        mem_end = mem_size;
+        interrupt_system = CLEAR;
+        interrupt_request = 0;
+        l_rom_enabled = FALSE;
+        l_rom_disable_delay = 0;
+        l_mask = l_global = l_fence = l_violation = 0;
+        l_protect_enabled = l_protect_pending = FALSE;
+        l_protect_faults = 0;
+        l_vcp_psave = l_vcp_romp = 0;
+        l_diag_reset (&l_diagnose);
+        l_diagnose_mode = 0; l_slave_delay = 0;
+        l_global_disabled = TRUE;
+        l_tbg_enabled = l_tbg_flag = FALSE;
+        l_tbg_phase = l_tbg_ticks = 0;
+        l_unimplemented_pending = FALSE;
+        l_parity_enabled = l_parity_pending = l_parity_even = FALSE;
+        l_parity_register = 0;
+        l_parity_faults = l_parity_fetch_faults = 0;
+        { uint32 address;
+          for (address = 2; address < mem_size; address++)
+              cpu_l_parity_write (address, mem_examine (address), TRUE);
+        }
+        l_power_failing = FALSE;
+        l_type23_enabled = TRUE;
+        CIR = 0;
+        mp_disable ();                                /* discard protection state from the prior model */
+        }
+
     else {                                              /* otherwise this is a 2100 or 211x */
         is_1000 = FALSE;                                /*   so set the model index */
         mem_end = mem_size - IBL_SIZE;                  /*     and reserve memory for the loader */
@@ -3850,6 +4143,450 @@ if (result == SCPE_OK) {                                /* if the change succeed
     }
 
 return result;
+}
+
+
+/* Load a user-supplied processor PROM image, four 1K pages of big-endian
+   words.  Do not concatenate the two original byte lanes: firmware.py validates
+   their programmer checksums and interleaves them first.  No reset is implied. */
+
+static t_stat set_lrom (UNIT *uptr, int32 value, CONST char *cptr, void *desc)
+{
+FILE *file;
+MEMORY_WORD image [4096];
+uint32 index;
+int high, low;
+uint8 filename [CBUFSIZE];
+uint32 length;
+
+if (!(cpu_configuration & CPU_1000_L))
+    return SCPE_NOFNC;
+if (cptr == NULL || *cptr == '\0')
+    return SCPE_MISVAL;
+if (*cptr == '"' || *cptr == '\'') {
+    if (strlen (cptr) >= sizeof filename
+      || sim_decode_quoted_string (cptr, filename, &length) != SCPE_OK)
+        return SCPE_ARG;
+    filename [length] = '\0';
+    cptr = (const char *) filename;
+    }
+file = sim_fopen (cptr, "rb");
+if (file == NULL)
+    return SCPE_OPENERR;
+for (index = 0; index < 4096; index++) {
+    high = fgetc (file);
+    low = fgetc (file);
+    if (high == EOF || low == EOF) {
+        fclose (file);
+        return SCPE_FMT;
+        }
+    image [index] = (MEMORY_WORD) TO_WORD (high, low);
+    }
+high = fgetc (file);
+low = ferror (file);
+fclose (file);
+if (high != EOF || low)
+    return SCPE_FMT;
+memcpy (l_rom, image, sizeof l_rom);                     /* install atomically after validation */
+l_rom_loaded = TRUE;
+l_rom_enabled = FALSE;
+return SCPE_OK;
+}
+
+
+/* Functional 17-bit RAM parity; no random electrical faults or diagnostic
+   shortcuts. SC 5 selects odd/even generation/checking. Console deposits are
+   valid odd-parity words; diagnostic writes follow the selected sense.
+   HP 02103-90007 section 4-2 (pp. 4-1/4-2), table 4-3 (p. 4-5). */
+
+static uint8 l_parity_bit (HP_WORD value, t_bool even)
+{
+value &= D16_MASK;
+value ^= value >> 8;
+value ^= value >> 4;
+value ^= value >> 2;
+value ^= value >> 1;
+return (uint8) ((value & 1) ^ ! even);
+}
+
+void cpu_l_parity_write (uint32 address, HP_WORD value, t_bool console)
+{
+if (cpu_configuration & CPU_1000_L && address >= 2 && address < 32768)
+    l_parity_bits [address] = l_parity_bit (value, console ? FALSE : l_parity_even);
+}
+
+void cpu_l_parity_read (uint32 address, HP_WORD value, t_bool fetch)
+{
+if (cpu_configuration & CPU_1000_L && l_parity_enabled && ! l_parity_pending
+  && address >= 2 && address < mem_size && address < 32768
+  && l_parity_bits [address] != l_parity_bit (value, l_parity_even)) {
+    l_parity_register = (address & LA_MASK) | (fetch ? D16_SIGN : 0);
+    l_parity_pending = TRUE;
+    l_parity_faults++;
+    if (fetch)
+        l_parity_fetch_faults++;
+    tprintf (cpu_dev, TRACE_DATA, "L parity fault: %s address %05o, value %06o\n",
+             fetch ? "fetch" : "data", address, value);
+    }
+}
+
+
+/* DMA receives the memory parity indication at its IOP chip. It must
+   stop that DMA and assert FLG22, rather than raise the CPU's SC5 request. */
+t_bool cpu_l_dma_parity_error (uint32 address, HP_WORD value)
+{
+return (cpu_configuration & CPU_1000_L) && l_parity_enabled
+    && address >= 2 && address < mem_size && address < 32768
+    && l_parity_bits[address] != l_parity_bit(value, l_parity_even);
+}
+
+
+/* The ROM address pins use the low ten CPU address bits plus processor output
+   bits 8:7.  CPU-internal A/B aliases do not cause ROM reads.  The READ/IR11
+   gating is documented in HP 02103-90009 Appendix A-1/A-3 and section 2.5.1.5. */
+
+t_bool cpu_l_rom_read (HP_WORD address, t_bool fetch, HP_WORD *value)
+{
+if (!(cpu_configuration & CPU_1000_L) || ! l_rom_loaded || ! l_rom_enabled
+  || address <= 1)
+    return FALSE;
+if (! fetch && IR & AB_MASK && (MRGOP (IR) || IOGOP (IR)))
+    return FALSE;
+*value = l_rom [((l_status >> 7) & 3) * 1024 + (address & 01777u)];
+return TRUE;
+}
+
+
+/* Functional L timer and gated Type 3 source. Pointer reads consume the
+   documented 1.8 us per level and may generate a request within a chain. */
+static t_bool l_tbg_request (void)
+{
+return l_tbg_flag && interrupt_system && l_type23_enabled && !(l_mask & 2);
+}
+
+static double l_io_time;
+double cpu_l_io_time (void) { return l_io_time; }
+
+static void l_tbg_advance (uint32 elapsed)
+{
+l_io_time += elapsed;
+/* The CPU chip emits TBT+ every 10ms; the card's SC6 enable gates
+   requests, rather than pausing the divider (02103-90009 table 2-2). */
+l_tbg_phase += elapsed;
+if (l_tbg_phase >= 200000) {
+    if (l_tbg_enabled) {
+        l_tbg_ticks += l_tbg_phase / 200000;
+        l_tbg_flag = TRUE;
+        }
+    l_tbg_phase %= 200000;
+    }
+}
+
+/* Standard L protection: 02103-90007 section 4-3 and ERD section 2.4.12.
+   This checks CPU operations only; console accesses and DMA are unaffected. */
+t_bool cpu_l_protect (HP_WORD address, t_bool jump)
+{
+if (!(cpu_configuration & CPU_1000_L) || ! l_protect_enabled)
+    return FALSE;
+if ((address >= 2 && address < l_fence) || (jump && address <= 1)) {
+    l_violation = err_PR;
+    l_protect_pending = TRUE;
+    l_protect_faults++;
+    return TRUE;
+    }
+return FALSE;
+}
+
+/* Card-driver registration: position specifies physical priority, identity is
+   the complete table 5-2 word (including SC). No synthetic cards are installed. */
+t_stat cpu_l_diag_configure (uint32 position, t_bool present, HP_WORD identity)
+{
+if (position < L_DIAG_SLOTS && l_diagnose.present[position] == (present != 0)
+  && l_diagnose.identity[position] == identity)
+    return SCPE_OK;                                 /* preserve restored enumeration state */
+return l_diag_configure (&l_diagnose, position, present, identity) ? SCPE_OK : SCPE_ARG;
+}
+
+/* Initial processor-card I/O subset.  Other select codes stop explicitly.
+   SC 1 overflow operations are documented in 02103-90007 section 3-19.
+   OTA/B 1 selects the ROM page (02103-90009 Appendix A, figure A-1).
+   SC 2 CLC/STC enable/disable ROM (02103-90007 section 2-11). */
+
+static t_stat l_iog (HP_WORD instruction)
+{
+uint32 select_code = instruction & SC_MASK;
+uint32 operation = instruction >> 6 & 7;
+HP_WORD data = ABREG [AB_SELECT (instruction)];
+t_bool clear = (instruction & IR_HCF) != 0;
+
+tprintf (cpu_dev, TRACE_IOBUS, "L I/O P=%05o IR=%06o data=%06o GR=%02o disabled=%u ROM=%u\n",
+         err_PR, instruction, data, l_global, l_global_disabled, l_rom_enabled);
+
+/* SC 0 is the L Type 3 master flag and control-reset address.
+   02103-90007 table 4-3 specifies system reset; KERN EXITN/CHIPS
+   relies on CRS stopping the onboard TBG as well as resetting I/O cards.
+   Its C modifier additionally clears the Type 3 enable flag. This is
+   not a CPU/power reset: RAM, A/B, P, CIR, ROM selection and the SC 4
+   type gate are preserved. Use L card handlers, not the legacy bus. */
+if (select_code == 0) {
+    switch (operation) {
+        case 1:                                        /* STF 0 / CLF 0 */
+            interrupt_system = clear ? CLEAR : SET;
+            return SCPE_OK;
+        case 2: case 3:                                /* test the flag before optional clear */
+            if ((interrupt_system == SET) == (operation == 3))
+                PR = PR + 1 & LA_MASK;
+            break;
+        case 7:                                        /* STC 0 is NOP; CLC 0 broadcasts CRS */
+            if (instruction & AB_MASK)
+                { l_diag_reset (&l_diagnose); l_diagnose_mode = 0; l_global_disabled = TRUE;
+                  l_tbg_enabled = l_tbg_flag = FALSE; l_tbg_phase = 0; l_mask = 0;
+                  l_asi_crs (); l_hpi_crs (); }
+            if (instruction & AB_MASK)
+                tprintf (cpu_dev, TRACE_DATA, "L-Series CRS: reset interface controls\n");
+            break;
+        case 4: ABREG [AB_SELECT (instruction)] |= l_asi_present (l_global) && !l_global_disabled ? l_asi_mask_read (l_global) : l_hpi_active () && !l_global_disabled && l_global == 027 ? l_hpi_mask_read () : l_mask; break;
+        case 5: ABREG [AB_SELECT (instruction)] = l_asi_present (l_global) && !l_global_disabled ? l_asi_mask_read (l_global) : l_hpi_active () && !l_global_disabled && l_global == 027 ? l_hpi_mask_read () : l_mask; break;
+        case 6: l_hpi_mask (data); l_asi_mask (data); l_mask = data & 2; break;              /* other bits reside on interface cards */
+        default:
+            return STOP_L_UNSUPPORTED;
+        }
+    if (clear)
+        interrupt_system = CLEAR;
+    return SCPE_OK;
+    }
+
+/* L processor SC 4 is not the M/E/F power-fail interface.  In particular,
+   SFS means power UP and SFC means power DOWN, and CIR is writable and six
+   bits wide.  HP 02103-90007 sections 4-9/4-11/4-12, table 4-3 (pp. 4-4/4-5).
+   STF/CLF are NOPs; the C modifier therefore has no flag side effect.
+   The enable latch gates the L TBG request independently of the Type 3 flag;
+   no L interrupt is routed through the incompatible M/E/F dispatcher. */
+if (select_code == 4) {
+    switch (operation) {
+        case 0:                                        /* HLT,C still needs VCP entry */
+            return STOP_L_UNSUPPORTED;
+        case 1:                                        /* STF/CLF: no operation */
+            break;
+        case 2: case 3:                                /* SFC: down; SFS: up */
+            if (l_power_failing == (operation == 2))
+                PR = PR + 1 & LA_MASK;
+            break;
+        case 4:                                        /* MIA/MIB: merge CIR */
+            ABREG [AB_SELECT (instruction)] |= CIR & SC_MASK;
+            break;
+        case 5:                                        /* LIA/LIB: load CIR */
+            ABREG [AB_SELECT (instruction)] = CIR & SC_MASK;
+            break;
+        case 6:                                        /* OTA/OTB: output CIR */
+            CIR = data & SC_MASK;
+            break;
+        case 7:                                        /* STC/CLC: enable/disable types 2 and 3 */
+            l_type23_enabled = (instruction & AB_MASK) == 0;
+            break;
+        }
+    return SCPE_OK;
+    }
+
+if (select_code == 5) {
+    switch (operation) {
+        case 1:                                        /* STF/CLF: select even/odd */
+            l_parity_even = ! clear;
+            return SCPE_OK;
+        case 2: case 3:
+            if (l_parity_even == (operation == 3))
+                PR = PR + 1 & LA_MASK;
+            break;
+        case 4:
+            ABREG [AB_SELECT (instruction)] |= l_parity_register;
+            break;
+        case 5:
+            ABREG [AB_SELECT (instruction)] = l_parity_register;
+            break;
+        case 6:
+            l_parity_register = data & LA_MASK;
+            break;
+        case 7:
+            l_parity_enabled = (instruction & AB_MASK) == 0;
+            if (! l_parity_enabled)
+                l_parity_pending = FALSE;
+            break;
+        default:
+            return STOP_L_UNSUPPORTED;
+        }
+    if (clear)
+        l_parity_even = FALSE;
+    return SCPE_OK;
+    }
+
+if (select_code == 1) {
+    switch (operation) {
+        case 1: O = clear ? 0 : 1; return SCPE_OK;      /* STO / CLO */
+        case 2: case 3:
+            if ((O != 0) == (operation == 3))
+                PR = PR + 1 & LA_MASK;
+            if (clear)
+                O = 0;
+            return SCPE_OK;                           /* SOC / SOS, with optional C */
+        case 6:
+            if (clear)
+                return STOP_L_UNSUPPORTED;
+            l_status = data;
+            return SCPE_OK;
+        case 4: case 5: {
+            HP_WORD input = (SR & 0037400u) | ((l_mask & 2) ? 0100000u : 0);
+            if (operation == 4) ABREG [AB_SELECT (instruction)] |= input;
+            else ABREG [AB_SELECT (instruction)] = input;
+            return SCPE_OK;
+            }
+        case 7: return SCPE_OK;                         /* STC/CLC 1 are NOP */
+        default:
+            return STOP_L_UNSUPPORTED;
+        }
+    }
+/* 02103-90007 table 4-3. Global enable is a flag, ROM enable a
+   separate control; neither alters the other or the processor mask. */
+if (select_code == 2) {
+    switch (operation) {
+        case 1: l_global_disabled = ! clear; return SCPE_OK;
+        case 2: case 3:
+            if (l_global_disabled == (operation == 3)) PR = PR + 1 & LA_MASK;
+            break;
+        case 4: case 5:
+            if (l_diagnose.active) {
+                uint16_t response;
+                /* 12005-90001 table 3-1 includes merge in diagnose reads. */
+                if (l_diag_read (&l_diagnose, 2, l_global_disabled, l_global, &response)) {
+                    if (l_diagnose_mode == 2 && l_asi_present (response & 077))
+                        response = (uint16_t) l_asi_mode2 (response & 077, l_global, l_global_disabled);
+                    else if (l_diagnose_mode == 2 && (response & 077) == 027)
+                        response = (uint16_t) l_hpi_mode2 (l_global, l_global_disabled);
+                    if (operation == 4) ABREG [AB_SELECT (instruction)] |= response;
+                    else ABREG [AB_SELECT (instruction)] = response;
+                    }                                  /* no responder: accumulator is unchanged */
+                }
+            else if (l_asi_any_active () || l_hpi_active ()) {
+                if (l_asi_present (l_global) || (l_hpi_active () && l_global == 027)) {
+                    if (operation == 4) ABREG [AB_SELECT (instruction)] |= l_global;
+                    else ABREG [AB_SELECT (instruction)] = l_global;
+                    }                                  /* no selected interface: no response */
+                }
+            else if (operation == 4) ABREG [AB_SELECT (instruction)] |= l_global;
+            else ABREG [AB_SELECT (instruction)] = l_global;
+            break;
+        case 6:
+            if (data < 010) {
+                l_diagnose_mode = data;
+                if (data == 1 || data == 2) l_diag_begin (&l_diagnose, l_global_disabled, l_global);
+                else l_diag_end (&l_diagnose, l_global_disabled, l_global);
+                l_asi_diagnose (data, l_global, l_global_disabled);
+                if (l_global_disabled || l_global == 027) l_hpi_diagnose (data);
+                }
+            else l_global = data & SC_MASK;
+            break;
+        case 7:
+            if (instruction & AB_MASK) { l_rom_enabled = l_rom_loaded; l_rom_disable_delay = 0; }
+            else if (l_rom_enabled) l_rom_disable_delay = 2; /* current instruction plus exit jump */
+            break;
+        default: return STOP_L_UNSUPPORTED;
+        }
+    if (clear) l_global_disabled = FALSE;
+    return SCPE_OK;
+    }
+/* 02103-90007 section 2-27 and table 4-3: C selects ROM-P,
+   not a flag-clear side effect. Registers reside on the slave-capable I/O
+   chip. Preserve all sixteen bits: original VCP uses high bits as flags.
+   Actual slave entry/return and CLC 3 delayed requests remain separate work. */
+if (select_code == 3) {
+    HP_WORD *value = clear ? &l_vcp_romp : &l_vcp_psave;
+    switch (operation) {
+        case 1: case 2: case 3: return SCPE_OK;          /* no flag, hence no skip */
+        case 4: ABREG [AB_SELECT (instruction)] |= *value; return SCPE_OK;
+        case 5: ABREG [AB_SELECT (instruction)] = *value; return SCPE_OK;
+        case 6: *value = data; return SCPE_OK;
+        case 7:
+            if (!(instruction & AB_MASK)) return SCPE_OK; /* STC 3 is NOP */
+            if (l_asi_active ()) { l_slave_delay = 4; return SCPE_OK; }
+            return STOP_L_UNSUPPORTED;                 /* no configured slave-capable interface */
+        default: return STOP_L_UNSUPPORTED;
+        }
+    }
+if (select_code == 6) {
+    switch (operation) {
+        case 1: l_tbg_flag = ! clear; return SCPE_OK;
+        case 2: case 3:
+            if (l_tbg_flag == (operation == 3)) PR = PR + 1 & LA_MASK;
+            break;
+        case 4: case 5: case 6: break;                 /* all transfers are NOP */
+        case 7:
+            l_tbg_enabled = (instruction & AB_MASK) == 0;
+            if (! l_tbg_enabled) l_tbg_flag = FALSE;    /* ERD table 2-1: CLC clears request */
+            break;
+        default: return STOP_L_UNSUPPORTED;
+        }
+    if (clear) l_tbg_flag = FALSE;
+    return SCPE_OK;
+    }
+if (select_code == 7) {
+    if (operation >= 4 && operation <= 6) {
+        if (clear) {
+            if (operation == 4) ABREG [AB_SELECT (instruction)] |= l_violation;
+            else if (operation == 5) ABREG [AB_SELECT (instruction)] = l_violation;
+            else l_violation = data & LA_MASK;
+            }
+        else if (operation == 6) l_fence = data & LA_MASK;
+        }
+    else if (operation == 7 && !(instruction & AB_MASK))
+        l_protect_enabled = TRUE;                      /* CLC 7 is NOP, not disable */
+    return SCPE_OK;
+    }
+/* Diagnose-2 direct SC queries return chip status even with GR enabled
+   (KERN M2SET). Mode 1 also allows direct ID queries with GR disabled.
+   These queries do not consume enumeration priority. */
+if (l_diagnose.active && (l_global_disabled || l_diagnose_mode == 2)
+  && (operation == 4 || operation == 5)) {
+    uint16_t response;
+    if (l_diag_read (&l_diagnose, select_code, TRUE, l_global, &response)) {
+        if (l_diagnose_mode == 2 && l_asi_present (response & 077))
+            response = (uint16_t) l_asi_mode2 (response & 077, l_global, l_global_disabled);
+        else if (l_diagnose_mode == 2 && (response & 077) == 027)
+            response = (uint16_t) l_hpi_mode2 (l_global, l_global_disabled);
+        if (operation == 4) ABREG [AB_SELECT (instruction)] |= response;
+        else ABREG [AB_SELECT (instruction)] = response;
+        }
+    return SCPE_OK;
+    }
+{   HP_WORD value = data;
+    t_bool skip;
+    if (l_asi_io (instruction, l_global, l_global_disabled, &value, &skip)
+      || l_hpi_io (instruction, l_global, l_global_disabled, &value, &skip)) {
+        if (operation == 4 || operation == 5) ABREG [AB_SELECT (instruction)] = value;
+        if (skip) PR = PR + 1 & LA_MASK;
+        return SCPE_OK;
+        }
+}
+/* The original universal L/XL ROM probes the absent mapping board using
+   these controls (12001-18001 MTST2/MTSTM). Standard L has no map to toggle. */
+if ((select_code == 011 || select_code == 013) && operation == 7)
+    return SCPE_OK;
+
+/* Provisional owner-selected idle-bus value, not established by HP manuals.
+   Installed L interfaces have already been dispatched. Unassigned inputs
+   use this fallback; documented but unfinished processor operations still stop. */
+if (select_code >= 010 && (operation == 4 || operation == 5)) {
+    if (l_diagnose.active) {
+        uint16_t response;
+        /* Merge uses the same interface data response. */
+        if (l_diag_read (&l_diagnose, select_code, l_global_disabled, l_global, &response)) {
+            if (operation == 4) ABREG [AB_SELECT (instruction)] |= response;
+            else ABREG [AB_SELECT (instruction)] = response;
+            }
+        return SCPE_OK;                                /* mode 1 no response preserves the accumulator */
+        }
+    ABREG [AB_SELECT (instruction)] = D16_MASK;         /* load or OR with all ones */
+    return SCPE_OK;
+    }
+return STOP_L_UNSUPPORTED;
 }
 
 
@@ -3993,7 +4730,7 @@ static t_stat set_loader (UNIT *uptr, int32 enable, CONST char *cptr, void *desc
 static MEMORY_WORD loader [IBL_SIZE];                       /* the shadow memory for the currently disabled loader */
 const  t_bool currently_enabled = (mem_end == mem_size);    /* TRUE if the loader is currently enabled */
 
-if (cpu_configuration & CPU_1000)                       /* if the current CPU is a 1000-series */
+if (cpu_configuration & (CPU_1000 | CPU_1000_L))        /* no 21xx protected loader on L or M/E/F */
     return SCPE_NOFNC;                                  /*   then the protected loader does not exist */
 
 if (currently_enabled && enable == 0) {                 /* if the enabled loader is being disabled */
@@ -4244,7 +4981,9 @@ static t_stat show_model (FILE *st, UNIT *uptr, int32 val, CONST void *desc)
 {
 fputs ((const char *) desc, st);                        /* output the CPU model name */
 
-if (!(cpu_configuration & CPU_1000))                    /* if the CPU is a 2100 or 21xx */
+if (cpu_configuration & CPU_1000_L)
+    fputs (", experimental CPU/processor-ROM support", st);
+else if (!(cpu_configuration & CPU_1000))               /* if the CPU is a 2100 or 21xx */
     if (mem_end < mem_size)                             /*   then if the loader area is non-existent */
         fputs (", loader disabled", st);                /*     then report that the loader is disabled */
     else                                                /*   otherwise */
@@ -4574,6 +5313,61 @@ uint32  ab_selector, result, skip;
 HP_WORD data;
 t_bool  rss;
 t_stat  status = SCPE_OK;
+
+/* HP 02103-90007 sections 3-15 through 3-21 and Appendix A specify
+   the common integer operations.  Only documented EAU encodings are enabled;
+   unrecognized CPU encodings trap at 10; unfinished simulator features stop. */
+if (cpu_configuration & CPU_1000_L) {
+    if (l_protect_enabled && ! int_ack
+      && (((IR & ~(SC_MASK | IR_HCF)) == IR_HLT) || (IOGOP (IR) && (IR & SC_MASK) != 1))) {
+        l_violation = err_PR;
+        l_protect_pending = TRUE;
+        l_protect_faults++;
+        return SCPE_OK;                                /* inhibit all effects of the I/O instruction */
+        }
+    if ((IR & ~SC_MASK) == IR_HLT) {
+        if (l_asi_active () && l_rom_loaded && !l_rom_enabled) {
+            l_vcp_psave = PR;
+            PR = l_vcp_romp & LA_MASK;
+            l_rom_enabled = TRUE;
+            cpu_interrupt_enable = CLEAR;
+            return SCPE_OK;
+            }
+        return STOP_HALT;
+        }                               /* VCP return requires an active console and loaded ROM */
+    if (IOGOP (IR)) {
+        cpu_interrupt_enable = CLEAR;
+        return l_iog (IR);
+        }
+    /* 02103-90009 figure 2-8, sheets 1/2 (2/34A-B): JL* uses the
+       EAU operand/indirect path, increments saved P past the operand, loads
+       that return address into A/B, then jumps to the resolved destination.
+       E and O are unchanged.  Decode only the canonical L encodings. */
+    if (IR == 0100600u || IR == 0104600u) {
+        OPS operands;
+
+        status = cpu_ops (OP_A, operands);
+        if (status == SCPE_OK && cpu_l_protect (operands [0].word, TRUE))
+            return SCPE_OK;
+        if (status == SCPE_OK) {
+            ABREG [AB_SELECT (IR)] = PR;
+            PCQ_ENTRY;
+            PR = operands [0].word & LA_MASK;
+            }
+        return status;
+        }
+    if (! MRGOP (IR) && ! SRGOP (IR) && ! ASGOP (IR))
+        switch (IR & 0177760u) {
+            case 0100020u: case 0100040u: case 0100100u: /* ASL, LSL, RRL */
+            case 0101020u: case 0101040u: case 0101100u: /* ASR, LSR, RRR */
+            case 0100200u: case 0100400u:               /* MPY, DIV */
+            case 0104200u: case 0104400u:               /* DLD, DST */
+                break;
+            default:
+                l_unimplemented_pending = TRUE;
+                return SCPE_OK;
+            }
+    }
 
 switch (UPPER_BYTE (IR)) {                              /* dispatch on bits 15-8 of the instruction */
 
@@ -4936,10 +5730,24 @@ if (IR & IR_CP)                                         /* if the instruction sp
 else                                                    /* otherwise */
     MR = IR & (IR_IND | IR_OFFSET);                     /*   the offset is on the base page */
 
-if (MR & IR_IND)                                        /* if the address is indirect */
-    return cpu_resolve_indirects (TRUE);                /*   then resolve it to a direct address with interruptibility */
-else                                                    /* otherwise */
-    return SCPE_OK;                                     /*   the address in MR is already direct */
+if (MR & IR_IND) {
+    t_stat status = cpu_resolve_indirects (TRUE);
+    if (status != SCPE_OK) return status;
+    }
+if (cpu_configuration & CPU_1000_L) {
+    uint32 operation = IR & 0074000u;
+    if (operation == 0014000u || operation == 0024000u || operation == 0034000u
+      || operation == 0070000u || operation == 0074000u) {
+        if (cpu_l_protect (MR, operation == 0024000u)) {
+            /* Violating jumps still load P (ERD 2.4.12, printed 2-37);
+               JSB suppresses its store and advances P to target+1. */
+            if (operation == 0014000u) PR = MR + 1 & LA_MASK;
+            else if (operation == 0024000u) PR = MR;
+            return NOTE_L_PROTECT;
+            }
+        }
+    }
+return SCPE_OK;
 }
 
 

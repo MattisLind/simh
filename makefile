@@ -1804,6 +1804,7 @@ HP2100 = ${HP2100D}/hp2100_baci.c ${HP2100D}/hp2100_cpu.c \
         ${HP2100D}/hp2100_mux.c ${HP2100D}/hp2100_pif.c \
         ${HP2100D}/hp2100_pt.c ${HP2100D}/hp2100_sys.c \
         ${HP2100D}/hp2100_tbg.c ${HP2100D}/hp2100_tty.c
+HP2100 += ${HP2100D}/hp2100_l_iop.c ${HP2100D}/hp2100_l_asi.c ${HP2100D}/hp2100_l_hpi.c ${HP2100D}/hp2100_l_amigo.c
 HP2100_OPT = -DHAVE_INT64 -I ${HP2100D}
 
 HP3000D = ${SIMHD}/HP3000

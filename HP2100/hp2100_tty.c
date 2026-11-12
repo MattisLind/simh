@@ -799,6 +799,8 @@ tprintf (tty_dev, TRACE_PSERV, "Poll delay %d service entered\n",
 uptr->wait = hp_sync_poll (SERVICE);                    /* coschedule with the poll timer */
 sim_activate (uptr, uptr->wait);                        /*   and continue the poll */
 
+if (l_asi_active()) return SCPE_OK;                 /* L console owns keyboard polling */
+
 if (tty.cr_seen && key_unit.flags & UNIT_AUTOLF) {      /* if a CR was seen and auto-linefeed mode is active */
     input = LF;                                         /*   then simulate the input of a LF */
 

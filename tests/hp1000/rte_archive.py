@@ -9,10 +9,16 @@ import struct
 from rte_disk import inspect
 
 
-def saver_tape(image, destination, extra_files=()):
+def saver_tape(image, destination, extra_files=(), file_names=None):
     directory = inspect(image)
     original = image.read_bytes()
-    files = [dict(entry) for entry in directory['files'] if entry['type'] == 5]
+    if any(entry.get('extent', 0) and (file_names is None or entry['name'] in file_names)
+           for entry in directory['files']):
+        raise ValueError('SAVER transport does not yet support file extents')
+    files = [dict(entry) for entry in directory['files'] if entry['type'] == 5
+             and (file_names is None or entry['name'] in file_names)]
+    if file_names is not None and {entry['name'] for entry in files} != set(file_names):
+        raise ValueError('requested relocatable file absent')
     payloads = {entry['name']: original[entry['offset']:entry['offset'] + entry['bytes']]
                 for entry in files}
     for name, kind, payload in extra_files:

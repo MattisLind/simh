@@ -7,7 +7,7 @@
 typedef struct {
     HP_WORD reg[32];
     uint32 flags, controls, diagnose_mode, dma_wait;
-    t_bool dma_enabled, srq_mask, irq_pending, self_configured, auto_pending;
+    t_bool dma_enabled, srq_mask, irq_pending, self_configured, auto_pending, count_started;
 } L_IOP;
 #define L_IOP_CONFIG 1
 #define L_IOP_START  2

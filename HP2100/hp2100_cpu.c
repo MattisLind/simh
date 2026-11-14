@@ -1164,12 +1164,16 @@ static uint32    last_select_code = 0;          /* the last select code sent ove
 static HP_WORD   saved_MR         = 0;          /* the M-register value between SCP commands */
 
 static MEMORY_WORD l_rom [4096] = { 0 };       /* four 1K-word processor PROM pages */
+static uint8 l_maps [64];                    /* physical-write copies, ERD 8-13..16 */
+static t_bool l_map_logical, l_map_override, l_map_self_mask;
+static uint32 l_map_pending;                  /* 0 none, 1 physical, 2 logical */
 static t_bool l_rom_loaded = FALSE;             /* image supplied by the user; never bundled */
+static uint32 l_rom_enable_delay = 0;           /* CLC 2 preserves the prefetched RAM call */
 static uint32 l_rom_disable_delay = 0;          /* STC 2 allows the following ROM exit jump */
 static t_bool l_rom_enabled = FALSE;            /* CLC 2 / STC 2 ROM overlay control */
 static t_bool l_power_failing = FALSE;         /* processor power-warning input; FALSE means power up */
 static t_bool l_type23_enabled = TRUE;          /* SC 4 interrupt type 2/3 enable latch */
-static uint8 l_parity_bits [32768] = { 0 };     /* stored seventeenth bit for standard L RAM */
+static uint8 l_parity_bits [262144] = { 0 };     /* stored seventeenth bit for standard L RAM */
 static t_bool l_parity_even = FALSE;             /* SC 5 flag: 0 odd, 1 even */
 static t_bool l_parity_enabled = FALSE;          /* SC 5 control */
 static t_bool l_parity_pending = FALSE;          /* unmaskable memory parity request */
@@ -1256,7 +1260,7 @@ static const FEATURE_TABLE cpu_features [] = {          /* CPU features indexed 
 
   { UNIT_EAU,                                          /*   L-Series standard integer/EAU instructions */
     0,                                                 /*   no M/E/F firmware or backplane options */
-    32 * 1024                                          /*   standard L; XL expansion is not emulated */
+    256 * 1024                                         /*   12002A XL controller when memory exceeds 32KW */
     }
   };
 
@@ -1392,6 +1396,11 @@ static REG cpu_reg [] = {
     { BRDATA (LDPART, l_diagnose.participant, 8, 1, L_DIAG_SLOTS), REG_HRO },
     { BRDATA (LDSEEN, l_diagnose.responded, 8, 1, L_DIAG_SLOTS), REG_HRO },
     { ORDATA (LPSAVE, l_vcp_psave,                 16)                                                  },
+    { BRDATA (LMAPS, l_maps, 8, 8, 64) },
+    { FLDATA (LMAPON, l_map_logical, 0) },
+    { FLDATA (LMAPOVR, l_map_override, 0) },
+    { FLDATA (LMAPSC5, l_map_self_mask, 0) },
+    { DRDATA (LMAPNEXT, l_map_pending, 2) },
     { ORDATA (LROMP,  l_vcp_romp,                  16)                                                  },
     { ORDATA (LFENCE, l_fence,                     15)                                                  },
     { ORDATA (LVIO,   l_violation,                 15)                                                  },
@@ -1405,9 +1414,10 @@ static REG cpu_reg [] = {
     { DRDATA (LPFAULT, l_parity_faults,            32),                       REG_RO            },
     { DRDATA (LPFETCH, l_parity_fetch_faults,      32),                       REG_RO            },
     { ORDATA (LPAR,    l_parity_register,          16)                                                  },
-    { BRDATA (LPBITS,  l_parity_bits,        8,     1,             32768),             REG_HRO           },
+    { BRDATA (LPBITS,  l_parity_bits,        8,     1,             262144),             REG_HRO           },
     { FLDATA (LPFAIL,  l_power_failing,                     0)                                          },
     { FLDATA (LINT23,  l_type23_enabled,                     0)                                          },
+    { DRDATA (LROMENT, l_rom_enable_delay, 2) },
     { DRDATA (LROMDLY, l_rom_disable_delay, 2) },
     { FLDATA (LROMEN,  l_rom_enabled,                       0)                                          },
     { FLDATA (LROMLD,  l_rom_loaded,                        0),                       REG_RO            },
@@ -2181,6 +2191,7 @@ while (status == SCPE_OK) {                             /* execute until simulat
         cpu_interrupt_enable = CLEAR;
         tprintf (cpu_dev, TRACE_DATA, "L parity interrupt: address %06o, return P %05o\n",
                  l_parity_register, PR);
+        cpu_l_map_reset ();
         IR = ReadF (5);
         }
 
@@ -2191,6 +2202,7 @@ while (status == SCPE_OK) {                             /* execute until simulat
         l_unimplemented_pending = FALSE;
         interrupt_acknowledge = TRUE;
         cpu_interrupt_enable = CLEAR;
+        cpu_l_map_reset ();
         IR = ReadF (010);
         }
 
@@ -2201,6 +2213,7 @@ while (status == SCPE_OK) {                             /* execute until simulat
         l_protect_pending = FALSE;
         interrupt_acknowledge = TRUE;
         cpu_interrupt_enable = CLEAR;
+        cpu_l_map_reset ();
         IR = ReadF (7);
         }
 
@@ -2212,6 +2225,7 @@ while (status == SCPE_OK) {                             /* execute until simulat
         l_tbg_flag = FALSE;
         interrupt_acknowledge = TRUE;
         cpu_interrupt_enable = CLEAR;
+        cpu_l_map_reset ();
         IR = ReadF (6);
         }
 
@@ -2224,6 +2238,7 @@ while (status == SCPE_OK) {                             /* execute until simulat
         l_global_disabled = FALSE;
         interrupt_acknowledge = TRUE;
         cpu_interrupt_enable = CLEAR;
+        if (cpu_configuration & CPU_1000_L) cpu_l_map_reset ();
         IR = ReadF (CIR);
         }
 
@@ -2259,6 +2274,7 @@ while (status == SCPE_OK) {                             /* execute until simulat
         if (CIR != MPPE)                                /* if the MP is not interrupting */
             io_assert (iot [MPPE].devptr, ioa_IAK);     /*   then notify MP of the IAK too */
 
+        if (cpu_configuration & CPU_1000_L) cpu_l_map_reset ();
         IR = ReadF (CIR);                               /* fetch the trap cell instruction */
         }
 
@@ -2369,6 +2385,8 @@ while (status == SCPE_OK) {                             /* execute until simulat
     if (status == NOTE_L_PROTECT)
         status = SCPE_OK;                               /* service the pending violation at the boundary */
 
+    if (cpu_configuration & CPU_1000_L && l_rom_enable_delay && status == SCPE_OK)
+        if (--l_rom_enable_delay == 0) l_rom_enabled = l_rom_loaded;
     if (cpu_configuration & CPU_1000_L && l_rom_disable_delay && status == SCPE_OK)
         if (--l_rom_disable_delay == 0) l_rom_enabled = FALSE;
 
@@ -3776,6 +3794,7 @@ else                                                    /* otherwise */
    The listing's first software entry is offset 2, not its data words 0/1.
    HP 02103-90009 Appendix A-3/A-4; 12001-18001 lines 85-90. */
 if (cpu_configuration & CPU_1000_L && sim_switches & SWMASK ('P')) {
+    cpu_l_map_reset ();
     l_status = 0;
     l_mask = l_global = l_fence = l_violation = 0;
     l_protect_enabled = l_protect_pending = FALSE;
@@ -3794,7 +3813,7 @@ if (cpu_configuration & CPU_1000_L && sim_switches & SWMASK ('P')) {
     l_type23_enabled = TRUE;
     CIR = 0;
     l_rom_enabled = l_rom_loaded;
-    l_rom_disable_delay = 0;
+    l_rom_disable_delay = 0; l_rom_enable_delay = 0;
     if (l_rom_loaded)
         PR = 2;
     }
@@ -3854,6 +3873,7 @@ const int32 rom_socket  = IBL_ROM (SR);                 /* the ROM socket number
 if (cpu_configuration & CPU_1000_L) {
     if (! l_rom_loaded)
         return SCPE_NOFNC;
+    cpu_l_map_reset ();
     l_status = 0;
     l_rom_enabled = TRUE;
     PR = 2;                                            /* original software pretest entry */
@@ -4111,8 +4131,9 @@ if (result == SCPE_OK) {                                /* if the change succeed
         mem_end = mem_size;
         interrupt_system = CLEAR;
         interrupt_request = 0;
+        cpu_l_map_reset ();
         l_rom_enabled = FALSE;
-        l_rom_disable_delay = 0;
+        l_rom_disable_delay = 0; l_rom_enable_delay = 0;
         l_mask = l_global = l_fence = l_violation = 0;
         l_protect_enabled = l_protect_pending = FALSE;
         l_protect_faults = 0;
@@ -4194,6 +4215,34 @@ return SCPE_OK;
 }
 
 
+/* 12002A XL mapping: 02103-90009 8-13..16, 8-27..32. */
+t_bool cpu_l_xl_present (void)
+{ return (cpu_configuration & CPU_1000_L) && mem_size > 32768; }
+void cpu_l_map_reset (void)
+{ l_map_logical = l_map_override = l_map_self_mask = FALSE; l_map_pending = 0; }
+uint32 cpu_l_map_address (HP_WORD address, t_bool alternate)
+{
+if (!cpu_l_xl_present () || address <= 1) return address;
+if ((l_map_logical && !l_map_override) != alternate)
+    return ((uint32) l_maps[address >> 10] << 10) | (address & 01777);
+return address;
+}
+void cpu_l_map_write (uint32 address, HP_WORD value, t_bool physical)
+{
+if (cpu_l_xl_present () && physical && address >= 0100 && address <= 0177)
+    l_maps[address - 0100] = value & 0377;
+}
+t_bool cpu_l_map_physical (t_bool alternate)
+{ return !cpu_l_xl_present () || (l_map_logical && !l_map_override) == alternate; }
+uint32 cpu_l_dma_address (HP_WORD address, HP_WORD control, t_bool self_configure)
+{
+uint32 selector = control & 037;
+if (!cpu_l_xl_present () || !selector || (self_configure && !l_map_self_mask)) return address;
+return ((((uint32) l_maps[32 + selector] + (address >> 10)) & 0377) << 10) | (address & 01777);
+}
+t_bool cpu_l_dma_maps (HP_WORD control, t_bool self_configure)
+{ return !(control & 037) || (self_configure && !l_map_self_mask); }
+
 /* Functional 17-bit RAM parity; no random electrical faults or diagnostic
    shortcuts. SC 5 selects odd/even generation/checking. Console deposits are
    valid odd-parity words; diagnostic writes follow the selected sense.
@@ -4211,16 +4260,16 @@ return (uint8) ((value & 1) ^ ! even);
 
 void cpu_l_parity_write (uint32 address, HP_WORD value, t_bool console)
 {
-if (cpu_configuration & CPU_1000_L && address >= 2 && address < 32768)
+if (cpu_configuration & CPU_1000_L && address >= 2 && address < 262144)
     l_parity_bits [address] = l_parity_bit (value, console ? FALSE : l_parity_even);
 }
 
 void cpu_l_parity_read (uint32 address, HP_WORD value, t_bool fetch)
 {
 if (cpu_configuration & CPU_1000_L && l_parity_enabled && ! l_parity_pending
-  && address >= 2 && address < mem_size && address < 32768
+  && address >= 2 && address < mem_size && address < 262144
   && l_parity_bits [address] != l_parity_bit (value, l_parity_even)) {
-    l_parity_register = (address & LA_MASK) | (fetch ? D16_SIGN : 0);
+    l_parity_register = (MR & LA_MASK) | (fetch ? D16_SIGN : 0);
     l_parity_pending = TRUE;
     l_parity_faults++;
     if (fetch)
@@ -4236,7 +4285,7 @@ if (cpu_configuration & CPU_1000_L && l_parity_enabled && ! l_parity_pending
 t_bool cpu_l_dma_parity_error (uint32 address, HP_WORD value)
 {
 return (cpu_configuration & CPU_1000_L) && l_parity_enabled
-    && address >= 2 && address < mem_size && address < 32768
+    && address >= 2 && address < mem_size && address < 262144
     && l_parity_bits[address] != l_parity_bit(value, l_parity_even);
 }
 
@@ -4339,7 +4388,7 @@ if (select_code == 0) {
             break;
         case 7:                                        /* STC 0 is NOP; CLC 0 broadcasts CRS */
             if (instruction & AB_MASK)
-                { l_diag_reset (&l_diagnose); l_diagnose_mode = 0; l_global_disabled = TRUE;
+                { cpu_l_map_reset (); l_diag_reset (&l_diagnose); l_diagnose_mode = 0; l_global_disabled = TRUE;
                   l_tbg_enabled = l_tbg_flag = FALSE; l_tbg_phase = 0; l_mask = 0;
                   l_asi_crs (); l_hpi_crs (); }
             if (instruction & AB_MASK)
@@ -4485,7 +4534,7 @@ if (select_code == 2) {
             else l_global = data & SC_MASK;
             break;
         case 7:
-            if (instruction & AB_MASK) { l_rom_enabled = l_rom_loaded; l_rom_disable_delay = 0; }
+            if (instruction & AB_MASK) { l_rom_enable_delay = l_rom_enabled ? 0 : 2; l_rom_disable_delay = 0; }
             else if (l_rom_enabled) l_rom_disable_delay = 2; /* current instruction plus exit jump */
             break;
         default: return STOP_L_UNSUPPORTED;
@@ -4565,6 +4614,17 @@ if (l_diagnose.active && (l_global_disabled || l_diagnose_mode == 2)
         return SCPE_OK;
         }
 }
+if (cpu_l_xl_present () && (select_code == 011 || select_code == 013) && operation == 7) {
+    if (select_code == 011) l_map_pending = (instruction & AB_MASK) ? 1 : 2;
+    else {
+        l_map_override = (instruction & AB_MASK) != 0;
+        l_map_self_mask = !(instruction & AB_MASK) && clear;
+        }
+    return SCPE_OK;
+    }
+/* RTE-XL RTIOL 92071-18092 controls an optional external 1610A
+   analyzer at SC15. With no analyzer installed, its outputs have no effect. */
+if (select_code == 015 && operation == 7) return SCPE_OK;
 /* The original universal L/XL ROM probes the absent mapping board using
    these controls (12001-18001 MTST2/MTSTM). Standard L has no map to toggle. */
 if ((select_code == 011 || select_code == 013) && operation == 7)
@@ -5339,6 +5399,25 @@ if (cpu_configuration & CPU_1000_L) {
         cpu_interrupt_enable = CLEAR;
         return l_iog (IR);
         }
+    /* 12002A observes these DLD/DST bus cycles. Only A crosses maps;
+       B loads in the original mode, and its store is always inhibited. */
+    if (cpu_l_xl_present () && (IR == 0104213 || IR == 0104413)) {
+        HP_WORD operand = ReadW (PR);
+        PR = (PR + 1) & LA_MASK;
+        if (operand & D16_SIGN) {
+            if ((operand & LA_MASK) > 1) return STOP_L_UNSUPPORTED;
+            operand = ABREG [operand & 1];
+            if (operand & D16_SIGN) return STOP_L_UNSUPPORTED;
+            }
+        operand &= LA_MASK;
+        if (IR == 0104213) {
+            data = ReadWA (operand);
+            BR = ReadW ((operand + 1) & LA_MASK);
+            AR = data;
+            }
+        else if (!l_protect_enabled) WriteWA (operand, AR);
+        return SCPE_OK;
+        }
     /* 02103-90009 figure 2-8, sheets 1/2 (2/34A-B): JL* uses the
        EAU operand/indirect path, increments saved P past the operand, loads
        that return address into A/B, then jumps to the resolved destination.
@@ -5447,6 +5526,10 @@ switch (UPPER_BYTE (IR)) {                              /* dispatch on bits 15-8
 
         PCQ_ENTRY;                                      /* save P in the queue */
         PR = MR;                                        /*   and jump to the target address */
+        if (cpu_configuration & CPU_1000_L && cpu_l_xl_present () && l_map_pending) {
+            l_map_logical = l_map_pending == 2;
+            l_map_pending = 0;
+            }
         break;
 
 

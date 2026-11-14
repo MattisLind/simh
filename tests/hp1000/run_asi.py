@@ -259,6 +259,68 @@ def main():
     instruction('SFS 30', expected={'P': 0o102})
     run('last-UART-TRE-interrupt-survives-DMA-CINT', commands)
 
+    for name, sc in [('ASI',0o20),('ASI1',0o21)]:
+        capture=args.output/(name.lower()+'-ack.txt')
+        capture.write_bytes(b'')
+        commands=['set cpu 1000-L',f'set {name} enabled',
+                  f'set {name} NOLOOPBACK',f'set {name} NOHOOD',
+                  f'set {name} LOCALACK','reset -p',f'attach {name} {capture.resolve()}',
+                  'deposit 1000 JMP 1000']
+        instruction('OTA 2,C',sc)
+        instruction('OTA 31',0o1404)  # Eight-bit transmit, no diagnostic loop.
+        instruction('OTA 30',5)
+        instruction('STC 30,C')
+        wait()
+        commands += [f'assert {name} RXREADY=1',f'assert {name} RX=6']
+        instruction('OTA 31',0o2404)
+        instruction('STC 30,C')
+        wait()
+        instruction('LIA 30,C',expected={'A':6})
+        # Eight-bit binary 0205 is not ENQ; REMOTEACK must pass ENQ out.
+        instruction('OTA 31',0o1404)
+        instruction('OTA 30',0o205)
+        instruction('STC 30,C')
+        wait()
+        commands += [f'assert {name} RXREADY=0',f'set {name} REMOTEACK']
+        instruction('OTA 30',5)
+        instruction('STC 30,C')
+        wait()
+        commands += [f'assert {name} RXREADY=0',f'set {name} LOCALACK',
+                     f'set {name} LOOPBACK']
+        instruction('OTA 30',5)
+        instruction('STC 30,C')
+        wait()
+        commands += [f'assert {name} RX=5',f'detach {name}']
+        result=run(name.lower()+'-local-and-remote-ack',commands)
+        if capture.read_bytes()!=bytes([0o205,5]):result['status']='FAIL'
+
+        capture=args.output/(name.lower()+'-status.txt')
+        capture.write_bytes(b'')
+        commands=['set cpu 1000-L',f'set {name} enabled',
+                  f'set {name} LOCALSTATUS','reset -p',
+                  f'attach {name} {capture.resolve()}','deposit 1000 JMP 1000']
+        instruction('OTA 2,C',sc)
+        instruction('OTA 31',0o1404)
+        for value in [0o33,ord('^'),0o21]:
+            instruction('OTA 30',value)
+            instruction('STC 30,C')
+            wait()
+        instruction('OTA 31',0o2404)
+        for value in b'\x1b\\4001468\r':
+            wait()
+            commands += [f'assert {name} RXREADY=1']
+            instruction('LIA 30,C',expected={'A':value})
+        wait()
+        commands += [f'assert {name} RXREADY=0',f'set {name} REMOTESTATUS']
+        instruction('OTA 31',0o1404)
+        for value in [0o33,ord('^'),0o21]:
+            instruction('OTA 30',value)
+            instruction('STC 30,C')
+            wait()
+        commands += [f'assert {name} RXREADY=0',f'detach {name}']
+        result=run(name.lower()+'-local-and-remote-status',commands)
+        if capture.read_bytes()!=b'\x1b^\x1b^\x11':result['status']='FAIL'
+
     root = args.root
     words, lanes = read_pair(root / '12001-16001_Rev-2140.src', root / '12001-16002_Rev-2150.src')
     image = args.output / 'processor-rom.bin'

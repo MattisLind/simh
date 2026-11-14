@@ -56,6 +56,8 @@ def main():
     parser.add_argument('--simulator', type=Path, default=Path('BIN/hp2100'))
     parser.add_argument('--output', type=Path, default=Path('build/hp1000/rte-l-generated'))
     parser.add_argument('--commands', type=Path, default=Path('tests/hp1000/config/rte-l-7902.gen'))
+    parser.add_argument('--generation-instructions', type=int, default=80000000,
+                        help='instruction budget for the original RTLGN run')
     args = parser.parse_args()
     out = args.output
     out.mkdir(parents=True, exist_ok=True)
@@ -71,6 +73,8 @@ def main():
     host = out / 'host.disc'
     host.write_bytes(swapped)
     answers = args.commands.read_text()
+    startup = re.search(r'^ST(?:,.*)?\nRE,%([^:]+)', answers, re.M)
+    startup = startup[1] if startup else 'none'
     (out / 'GENCMD.txt').write_text(answers)
     tape = out / 'input.tap'
     manifest = saver_tape(master, tape, [('GENCMD', 3, encode_text(answers))])
@@ -105,7 +109,7 @@ def main():
     send('LI,$MXLB::SC', 2000000)
     send('RE,\\045RTLGN::SC', 200000000)
     send('EN', 30000000)
-    send('RU,RTLGN,GENCMD::SC,SYSTEM::SC,SNAP::SC,SYLIST::SC', 80000000)
+    send('RU,RTLGN,GENCMD::SC,SYSTEM::SC,SNAP::SC,SYLIST::SC', args.generation_instructions)
     commands.extend(['echo HP1000_CHECK_PASS', 'exit'])
     script = out / 'generate.ini'
     script.write_text('\n'.join(commands) + '\n')
@@ -152,11 +156,13 @@ def main():
                   original_sources_unchanged=unchanged, sources=sources,
                   SYSTEM_sha256=hashlib.sha256(system).hexdigest(), kernel_entry=f'{entry:05o}',
                   SYSTEM_loaded=boot_result['status'] == 'PASS', memory_words_compared=0o76000 - 2,
-                  configuration='RTE-L memory-based COMND, 32KW, ASI SC20, HPI SC27, 7902 LU2/3, four IDs',
+                  configuration=f'RTE-L {startup} validation, 32KW, ASI SC20, HPI SC27, 7902 LU2/3, four IDs',
+                  startup_program=startup,
                   class_entries=int(re.search(r'^CL,(\d+)$', answers, re.M)[1]),
                   sam_words=int(re.search(r'^SA,(\d+)$', answers, re.M)[1]),
                   disk_based_FMGR_installed=False, diagnostics='NOT_RUN_BY_THIS_SCRIPT',
-                  next='run_rte_l_boot.py verifies HP2645 handshake, COMND prompt and TM')
+                  next=('run_rte_l_boot.py verifies HP2645 handshake, COMND prompt and TM'
+                        if startup == 'COMND' else 'install matching disk programs and validate startup'))
     (out / 'results.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
     return int(not unchanged or boot_result['status'] != 'PASS')

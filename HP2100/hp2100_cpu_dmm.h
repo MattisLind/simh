@@ -171,6 +171,9 @@ extern void   mem_copy_loader     (MEMORY_WORD *buffer, uint32 starting_address,
 extern t_bool mem_is_idle_loop    (void);
 extern void   mem_trace_registers (FLIP_FLOP interrupt_system);
 
+extern HP_WORD mem_l_dma_read (DEVICE *device, HP_WORD address, HP_WORD control, t_bool self_configure);
+extern void mem_l_dma_write (DEVICE *device, HP_WORD address, HP_WORD value, HP_WORD control, t_bool self_configure);
+
 /* Main memory global utility routines declared in io.h
 
 extern HP_WORD mem_examine  (uint32 address);

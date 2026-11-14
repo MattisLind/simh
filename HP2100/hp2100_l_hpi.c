@@ -20,7 +20,7 @@ static uint32 in_head, in_count, out_head, out_count;
 static uint32 backend = lh, registered, input_left, input_active, input_lf;
 static uint32 talking, listening, controller, end_input, dma_byte, configuring;
 static uint32 transfers, handshakes, errors, dma_started;
-static t_bool dma_fifo_wait, dma_input_wait;
+static t_bool dma_fifo_wait, dma_input_wait, input_hold;
 static unsigned primary_address, poll_line = 7;
 static t_bool poll_enabled = TRUE, poll_sense = TRUE, poll_configure;
 static HP_WORD dma_fifo_word;
@@ -28,6 +28,8 @@ static t_bool poll_timing;
 static double poll_started;
 #define hpi_event l_amigo_units[2]
 static REG hpi_reg[] = {
+    { FLDATA (INHOLD, input_hold, 0) },
+    { FLDATA (COUNTSTART, chip.count_started, 0) },
     { ORDATA (STATUS, status_word, 16) }, { ORDATA (CONTROL, control, 16) }, { ORDATA (MASK, mask_word, 16) },
     { ORDATA (BYTELATCH, byte_latch, 16) }, { ORDATA (HOLD, hold, 16) }, { ORDATA (DATA, read_data, 16) },
     { BRDATA (PHI, phi, 8, 10, 8) },
@@ -123,7 +125,7 @@ void l_hpi_crs (void)
     mask_word = 0;
     l_iop_reset(&chip); memset(phi, 0, sizeof phi);
     control = hold = read_data = byte_latch = status_word = 0;
-    dma_fifo_wait = dma_input_wait = FALSE; primary_address = 0;
+    dma_fifo_wait = dma_input_wait = input_hold = FALSE; primary_address = 0;
     poll_line = 7; poll_enabled = poll_sense = TRUE; poll_configure = poll_timing = FALSE;
     in_head = in_count = out_head = out_count = 0;
     input_left = input_active = input_lf = end_input = 0;
@@ -181,6 +183,16 @@ static void update_irq (void)
 {
     if ((control & 4) && interrupt_condition()) l_iop_flag(&chip, 030, TRUE);
 }
+/* The shared bus stores a combined NRFD level. Deny it only when this
+   listener asserted it; never release a disk's seek holdoff. */
+static void hold_input (t_bool holdoff)
+{
+    if (input_hold != holdoff) {
+        input_hold = holdoff;
+        di_bus_control((CARD_ID)backend, 31, holdoff ? BUS_NRFD : 0,
+                       holdoff ? 0 : BUS_NRFD);
+    }
+}
 static void schedule (void)
 { if (l_hpi_active() && !sim_is_active(&hpi_event)) sim_activate(&hpi_event, l_iop_diagnose_pending(&chip) ? (chip.dma_wait ? chip.dma_wait : 1) : 5); }
 void l_hpi_bus_update (void) { schedule(); }
@@ -199,7 +211,7 @@ t_bool l_hpi_bus_accept (uint8 data)
         input_active = 0; end_input = 1;
     }
     if (in_count == 8 || !input_active)
-        di_bus_control((CARD_ID)backend, 31, BUS_NRFD, 0);
+        hold_input(TRUE);
     update_irq();
     schedule(); return TRUE;
 }
@@ -224,7 +236,7 @@ static HP_WORD phi_read_raw (uint32 reg)
                 status_word = (status_word & ~020000u) | ((value & 01400) == 01400 ? 020000 : 0);
                 if ((value & 01400) == 0400) status_word |= 010000;
                 in_head = (in_head + 1) & 7; in_count--;
-                if (input_active) di_bus_control((CARD_ID)backend, 31, 0, BUS_NRFD);
+                if (input_active) hold_input(FALSE);
                 return value;
             }
             if (poll_elapsed(40))
@@ -318,7 +330,7 @@ static void dma_complete (void)
 {
     chip.dma_enabled = FALSE;
     if (configuring && (chip.reg[021] & 010000))
-        mem_write(&hpi_dev, DMA_Channel_1, (chip.reg[020] - 1) & 077777, chip.reg[023]);
+        mem_l_dma_write(&hpi_dev, (chip.reg[020] - 1) & 077777, chip.reg[023], chip.reg[021], TRUE);
     if (configuring && (chip.reg[021] & 0100000)) configure();
     else {
         t_bool pending = chip.irq_pending;
@@ -336,13 +348,18 @@ static void dma_transfer (void)
     t_bool last = FALSE;
     /* PPOLL holds N+1 SRQ until the outgoing FIFO drains. Memory count
        rollover can precede that last device handshake (4-11/4-12). */
-    if (!chip.reg[023]) {
+    if (!chip.reg[023] && chip.count_started) {
         if (!input && (control & 2) && !poll_elapsed(140)) return;
         dma_complete(); return;
     }
     if (input) {
         if (control & 0100000) {
-            if ((control & 070000) == 0 && !in_count && !(control & 04000)) {
+            /* PHI DMARQ follows register 6's FIFO selector, independently
+               of IOP transfer direction (12009-90001, 3-49). ID.37 selects
+               the outbound FIFO before draining up to eight inbound bytes;
+               its ready output FIFO therefore clocks even empty input reads. */
+            if ((control & 070000) == 0 && !in_count
+              && !(control & 04000) && !(phi[6] & 2)) {
                 if (!(control & 02000) && !dma_input_wait) {
                     phi_read(0); dma_input_wait = TRUE;
                 }
@@ -355,27 +372,31 @@ static void dma_transfer (void)
         last = ((control & 01000) && (value & 01400) == 01400)
             || ((control & 0400) && (value & 01400) == 0400);
         if (byte) {
-            word = mem_read(&hpi_dev, DMA_Channel_1, address);
+            word = mem_l_dma_read(&hpi_dev, address, chip.reg[021], chip.diagnose_mode == 3);
             value = dma_byte ? (word & 0177400) | (value & 0377) : ((value & 0377) << 8) | (word & 0377);
         }
         if (!byte) value |= control & 0170000;
-        mem_write(&hpi_dev, DMA_Channel_1, address, value);
+        mem_l_dma_write(&hpi_dev, address, value, chip.reg[021], chip.diagnose_mode == 3);
     }
     else {
         if (dma_fifo_wait && out_count == 8) return;
         dma_fifo_wait = FALSE;
         if ((control & 02000) && out_count == 8) return;
-        value = mem_read(&hpi_dev, DMA_Channel_1, address);
+        value = mem_l_dma_read(&hpi_dev, address, chip.reg[021], chip.diagnose_mode == 3);
         byte_latch = value;
         if (byte) {
             value = (control & 01700) | (dma_byte ? value & 0377 : value >> 8);
             if ((control & 01000) && chip.reg[023] != 0177777) value &= ~01000u;
             phi_write(control >> 12 & 7, value);
         }
-        else handshake(value);
+        else {
+            hold = value;
+            if (chip.reg[021] & 040000) handshake(value);
+        }
     }
     transfers++;
     chip.reg[023] = (chip.reg[023] + 1) & 0177777;
+    chip.count_started = TRUE;
     if (!byte || dma_byte) chip.reg[022] = (address + 1) & 077777;
     if (byte) dma_byte ^= 1;
     if ((!chip.reg[023] || last) && (input || !(control & 2) || poll_elapsed(140))) dma_complete();
@@ -433,29 +454,42 @@ t_stat l_hpi_service (UNIT *unit)
         l_iop_diagnose_step(&chip, &hpi_dev);
         configuring = chip.self_configured;
     }
-    if (end_input) { end_input = 0; di_bus_control((CARD_ID)backend, 31, BUS_ATN, BUS_NRFD); }
+    if (end_input) {
+        uint8 release = input_hold ? BUS_NRFD : 0;
+        end_input = input_hold = 0;
+        /* Assert ATN before releasing NRFD: DA may synchronously source
+           another byte when NRFD is denied with ATN low. */
+        di_bus_control((CARD_ID)backend, 31, BUS_ATN, release);
+    }
     offline_step();
     if (out_count && !input_active && (phi[7] & 0200)) {
         word = out_fifo[out_head]; accepted = TRUE;
         if ((word & 01400) == 0400) {
-            di_bus_control((CARD_ID)backend, 31, BUS_ATN, BUS_EOI);
+            uint8 release = BUS_EOI | (input_hold ? BUS_NRFD : 0);
+            input_active = end_input = input_hold = 0;
+            di_bus_control((CARD_ID)backend, 31, BUS_ATN, release);
+            if (di[backend].bus_cntl & BUS_NRFD) accepted = FALSE;
+            else {
             if ((word & 0377) == (0100 | (controller ? 036 : phi[7] & 037))) talking = 1;
             else if ((word & 0140) == 0100) talking = 0;
             if ((word & 0377) == (040 | (controller ? 036 : phi[7] & 037))) listening = 1;
             else if ((word & 0377) == 077) listening = 0;
             di[backend].cntl_register = listening ? 4 : 0; /* shared bus listener */
             di_bus_source((CARD_ID)backend, word & 0377);
+            }
         }
         else if (!talking && controller) {
             input_left = word & 0377; input_lf = !(word & 01000);
             input_active = (word & 01400) == 01400 && !input_left ? 2 : 1;
             if (!input_left && input_active == 1) input_left = 256;
-            di_bus_control((CARD_ID)backend, 31, 0, BUS_ATN | BUS_NRFD | BUS_EOI);
+            di_bus_control((CARD_ID)backend, 31, 0, BUS_ATN | BUS_EOI);
         }
         else {
             di_bus_control((CARD_ID)backend, 31, (word & 01000) ? BUS_EOI : 0,
                            BUS_ATN | ((word & 01000) ? 0 : BUS_EOI));
-            accepted = di_bus_source((CARD_ID)backend, word & 0377);
+            /* The shared disk backend may hold NRFD throughout a seek.
+               Retain this FIFO word until every listener is ready. */
+            accepted = !(di[backend].bus_cntl & BUS_NRFD) && di_bus_source((CARD_ID)backend, word & 0377);
         }
         if (accepted) { out_head = (out_head + 1) & 7; out_count--; }
     }
@@ -464,8 +498,11 @@ t_stat l_hpi_service (UNIT *unit)
         out_count++; dma_fifo_wait = FALSE;
     }
     if (chip.dma_enabled && !chip.srq_mask && chip.diagnose_mode != 3) {
+        /* Advance one DMA/configuration cycle per service. PHI and bus
+           handshakes must settle before the next self-configuration word. */
         if (!(control & 010) || interrupt_condition()) dma_started = 1;
-        if (dma_started && (!(control & 0100) || !interrupt_condition())) dma_transfer();
+        if (dma_started && !((control & 0100) && interrupt_condition()))
+            dma_transfer();
     }
     (void)poll_elapsed(0);
     update_irq();

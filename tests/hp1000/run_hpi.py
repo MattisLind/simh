@@ -178,6 +178,38 @@ def main():
     if scratch.read_bytes() != expected:
         result['status'] = 'FAIL'
 
+    # 07902-90030 A-29..30, A-38..39: a buffered read preloads exactly
+    # one sector. A short buffered write commits at EOI and retains the
+    # remainder of that controller buffer, even after an abbreviated read.
+    buffered = args.output / 'buffered.hpi'
+    original = bytes((i * 17 + 3) & 255 for i in range(77 * 2 * 30 * 256))
+    buffered.write_bytes(original)
+    commands = ['set cpu 1000-L', 'set HPI enabled',
+                f'attach HPI0 {buffered.resolve()}', 'reset -p']
+    instruction('OTA 2,C', 0o27)
+    for value in [0o70200, 0o60063, 0o60042,
+                  0o537, 0o477, 0o536, 0o440, 0o550, 2, 0, 0, 0, 0, 0o1002,
+                  0o537, 0o477, 0o536, 0o440, 0o552, 5, 0o1000]:
+        phi_output(value)
+    commands += ['assert HPI FDSECTOR[0]=3', 'assert HPI FDREPLYCOUNT=256']
+    for value in [0o537, 0o477, 0o476, 0o500, 0o540, 0o1004, 0o60040]:
+        phi_output(value)
+    for index, value in enumerate(original[512:516]):
+        phi_output(0o100000)
+        instruction('LIA 30', expected={'A': 0o100000 | value
+                                      | (0o1000 if index == 3 else 0)})
+    commands += ['assert HPI FDSECTOR[0]=3', 'assert HPI FDREPLYPOS=4']
+    for value in [0o537, 0o477, 0o536, 0o440, 0o551, 8, 0o1000,
+                  0o537, 0o477, 0o536, 0o440, 0o540, 0o252, 0o1273]:
+        phi_output(value)
+    commands += ['assert HPI FDSECTOR[0]=4', 'assert HPI FDWRITE=0',
+                 'assert HPI FDDSJ=0']
+    result = run('floppy-buffered-read-and-short-write', commands)
+    expected = bytearray(original)
+    expected[768:1024] = bytes([0xaa, 0xbb]) + original[514:768]
+    if buffered.read_bytes() != expected:
+        result['status'] = 'FAIL'
+
     commands = ['set cpu 1000-L', 'set HPI enabled', 'reset -p']
     instruction('OTA 2,C', 0o27)
     for value in (0o70140, 0o70040, 0o60042, 0o31114, 0o21777, 0o537, 0o1010):
@@ -288,6 +320,21 @@ def main():
     instruction('SFC 20', expected={'P': 0o102})
     run('PPOLL-N-plus-one-handshake-defers-DMA-completion', commands)
 
+    # PHI register 6 selects the FIFO generating DMARQ independently of
+    # the IOP's IN bit (3-49). The original ID.37 CLRIN uses outbound
+    # selection to clock an eight-byte inbound drain even when it is empty.
+    commands = ['set cpu 1000-L', 'set HPI enabled', 'reset -p']
+    instruction('OTA 2,C', 0o27)
+    phi_output(0o60002)
+    commands += ['deposit 300 61200', 'deposit 301 102000',
+                 'deposit 302 400', 'deposit 303 177770']
+    instruction('OTA 20', 0o300)
+    instruction('STC 20,C')
+    wait(2000)
+    commands += ['assert HPI DMAEN=0', 'assert HPI REGS[19]=0',
+                 'assert HPI REGS[18]=404', 'assert HPI INCOUNT=0']
+    run('PHI-DMARQ-FIFO-selector-independent-of-IOP-direction', commands)
+
     root = Path('hp1000-references/software/diagnostics/archives/type-4')
     words, _ = read_pair(root / '12001-16001_Rev-2140.src', root / '12001-16002_Rev-2150.src')
     rom = args.output / 'processor-rom.bin'
@@ -312,9 +359,10 @@ def main():
     # ROM execution page contains the loader's live return cells/workspace.
     commands += [f'assert {address:o}={int.from_bytes(data[address*2:address*2+2], "big"):o}'
                  for address in range(2, 0o76000)]
-    commands += ['nobreak 2', 'on error ignore', 'step 10000000',
-                 'on error exit 1', 'assert 204=102002', 'assert LPSAVE=205',
-                 'assert LROMEN=1']
+    commands += ['nobreak 2', 'break 204', 'on error ignore', 'step 10000000',
+                 'on error exit 1', 'assert P=204', 'assert LROMEN=0',
+                 'assert 204=102002', 'nobreak 204', 'on error ignore', 'step 1',
+                 'on error exit 1', 'assert LPSAVE=205', 'assert LROMEN=1']
     result = run('RTE-L-BOOTX-missing-SYSTEM', commands)
     directory = inspect(rte)
     (args.output / 'rte-l-directory.json').write_text(json.dumps(directory, indent=2) + '\n')

@@ -257,3 +257,86 @@ The CLASS-enabled, 1KW-SAM generation boots to SYSTEM READY and COMND. The boot
 test supplies HP2645 ACK only in response to ENQ, types TM, checks its guest-clock
 response and normal kernel-idle return. Memory-based COMND intentionally exits
 after one interactive command. This does not claim installed disk-based FMGR.
+
+Disk-based RTE-L/FMGR and native assembly validation:
+
+```
+python3 tests/hp1000/run_rte_l_fmgr.py
+```
+
+This runs original RTLGN and loaders on an IVB working copy, installs generated
+SYSTEM/SNAP plus native FMGR/ASMB/LOADR on a writable 7902 working image, then
+boots through original VCP/BOOTX. Real FMGR stores a source file; real ASMB and
+LOADR build HELLO; the CPU calculates 41+1 and prints ASSEMBLY TEST PASSED.
+A fresh boot executes HELLO and reads COPY again. A third boot exercises
+create/rename/read/purge. Original-media and distribution-file hashes must stay
+unchanged. --reuse-build repeats installation/tests using recorded build hashes.
+The output working image is recreated; preserve personal files separately.
+
+The buffered-transfer HPI regression also checks a shortened buffered read and
+a short buffered write against every byte of a synthetic disk image. See
+docs/hp1000/rte-l-fmgr.md and the XL follow-on plan in xl-memory.md.
+
+### XL memory and authentic RTE-XL
+
+`run_xl_memory.py` tests CPU translation, shadow-map writes, XLD/XST and the SC13
+override. `run_xl_diagnostic.py --memory 64` and `--memory 256` execute the complete
+unchanged HP XL diagnostic through VCP/BOOTX, with ASI/HPI/ASI1 DMA coverage.
+
+After `run_rte_l_fmgr.py`, run `run_rte_xl_generation.py`,
+`run_rte_xl_programs.py`, and `run_rte_xl_boot.py` to generate and test the native
+7902 XL/FMGR system. See [HP 1000 guide](../../docs/README.md) for
+provenance, the separate D.RTR requirement and current 7920 limits.
+
+7920 XL generation and verified file/reboot tests:
+
+```sh
+python3 tests/hp1000/run_rte_xl_generation.py --commands tests/hp1000/config/rte-xl-7920.gen --output build/hp1000/rte-xl-7920-generated
+python3 tests/hp1000/run_rte_xl_boot.py --disk 7920 --generated build/hp1000/rte-xl-7920-generated --output build/hp1000/rte-xl-7920
+python3 tests/hp1000/run_rte_xl_loader.py
+```
+
+`run_rte_xl_software.py` is an installation investigation, with strict failure
+reporting. It uses a separate image and does not establish that the language
+tools are usable until linking and compilation/execution have passed.
+
+Interactive RTE-XL and the tested BASIC/MACRO examples are documented in
+[the user guide](../../docs/README.md). Start a persistent
+working copy with:
+
+```sh
+python3 tests/hp1000/run_rte_xl.py
+```
+
+`run_rte_xl.py --check --image build/hp1000/rte-xl-console-check/disk.disc`
+checks the real pseudo-terminal path, host-text import, MACRO assembly, native
+linking, executable output, BASIC arithmetic and return to FMGR. The text
+importer has preservation and reference/binary-protection unit tests.
+
+## Type-5 RTE-XL application installation
+
+See [the consolidated HP 1000 guide](../../docs/README.md).
+Earlier development notes are backed up in `build/hp1000/docs-before-consolidation/`.
+The archive importer validates relocatable checksums and FMP envelopes; its
+records are independently compared with original XL master files. All online
+LOADR and application checks retain console logs under `build/hp1000/rte-xl-archive/`.
+
+`run_rte_xl_archive_smoke.py` tests EDIT save/reopen/help, FTN4X compile/link/run
+and OPEN/MAXREC with reboot persistence, and plain/macro assembly execution.
+`check_rte_xl_archive_console.py` also tests EDIT through the public PTY launcher
+with `--hp264x-status`. `run_rte_xl_image_schema.py` and
+`run_rte_xl_image_records.py` separately gate database creation and API persistence.
+Pascal generation/link success must not be reported as a boot or compiler pass.
+
+## Local terminal responses and standard SimH startup
+
+`SET ASI LOCALSTATUS` (also ASI1) answers the HP264x ESC/^/DC1 primary-status
+query through the UART receiver. `REMOTESTATUS` restores pass-through. The
+response describes 4KB display memory with block mode and auto-LF disabled;
+this is not screen emulation. `run_asi.py` tests both modes on both cards.
+`run_asi_status.py` boots XL and tests authentic EDIT save/reopen/help with
+LOCALACK/LOCALSTATUS and no host terminal responders. It requires the existing
+combined software image and EDIT smoke-test artifacts.
+
+Normal user startup uses the standard SimH file `HP2100/hp1000-xl.ini`, as
+explained in `docs/README.md`. Python scripts remain development/test tools.

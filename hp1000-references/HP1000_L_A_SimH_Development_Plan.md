@@ -421,3 +421,18 @@ See docs/hp1000/rte-l-built.md and diagnostic-results.md for reproducible script
 hashes and scope. This is a running memory-based COMND system, not yet an
 installed disk-based FMGR environment. Further conformance and long-running
 system validation remain separate work.
+
+## Current direction and FMGR milestone — 2026-11-12
+
+Disk-based RTE-L now boots through original VCP/BOOTX into authentic FMGR,
+initializes four swap areas, and runs native ASMB/LOADR. An assembled arithmetic
+program executes and survives a fresh boot. Real guest file creation, writing,
+reading, renaming and purging pass. Original media and all original distribution
+file payloads remain unchanged. Reproduce with run_rte_l_fmgr.py; details in
+docs/hp1000/rte-l-fmgr.md. This supersedes earlier memory-only FMGR limits.
+
+The owner dropped Chess/ALGOL. Next priorities are the L-Series XL mapping
+hardware within the existing CPU, authentic RTE-XL generation/boot, then an
+HP-IB 7920 installation with space for BASIC, Pascal, Fortran and assembly.
+New language packages will be supplied under software/operating-systems.
+The existing IVB 7920 host is separate from this target XL installation.

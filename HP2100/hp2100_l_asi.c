@@ -7,6 +7,8 @@
 
 #define UNIT_LOOPBACK (1u << UNIT_V_UF)
 #define UNIT_HOOD (1u << (UNIT_V_UF + 1))
+#define UNIT_LOCALACK (1u << (UNIT_V_UF + 2))
+#define UNIT_LOCALSTATUS (1u << (UNIT_V_UF + 3))
 #define ASI_CARDS 2
 extern DEVICE asi_dev, asi1_dev;
 static t_stat asi_service (UNIT *unit);
@@ -19,6 +21,8 @@ typedef struct {
     uint32 rx, tx, rx_ready, rx_wait, tx_wait, uart_diag, slave_pending;
     HP_WORD select_code, tx_latch;
     uint32 baud_code, dma_byte;
+    uint32 status_match, reply_pos, reply_count;
+    double reply_due;
     double tx_due, tx_started, break_start, baud_reset;
     t_bool parity_corrupt;
     t_bool break_low;
@@ -42,10 +46,15 @@ static UNIT asi_units[ASI_CARDS] = {
     { ORDATA (FLAGS, cards[n].chip.flags, 4) }, { ORDATA (CONTROLS, cards[n].chip.controls, 4) }, \
     { FLDATA (DMAEN, cards[n].chip.dma_enabled, 0) }, { FLDATA (SRQMASK, cards[n].chip.srq_mask, 0) }, \
     { FLDATA (IRQ, cards[n].chip.irq_pending, 0) }, \
+    { FLDATA (COUNTSTART, cards[n].chip.count_started, 0) }, \
     { BRDATA (REGS, cards[n].chip.reg, 8, 16, 32) }
 static REG asi_reg[] = { ASI_REGS(0), { NULL } };
 static REG asi1_reg[] = { ASI_REGS(1), { NULL } };
 static MTAB asi_mod[] = {
+    { UNIT_LOCALACK, UNIT_LOCALACK, "local ENQ/ACK", "LOCALACK", NULL },
+    { UNIT_LOCALACK, 0, "remote ENQ/ACK", "REMOTEACK", NULL },
+    { UNIT_LOCALSTATUS, UNIT_LOCALSTATUS, "local HP264x status", "LOCALSTATUS", NULL },
+    { UNIT_LOCALSTATUS, 0, "remote HP264x status", "REMOTESTATUS", NULL },
     { UNIT_LOOPBACK, UNIT_LOOPBACK, "loopback", "LOOPBACK", NULL },
     { UNIT_LOOPBACK, 0, "no loopback", "NOLOOPBACK", NULL },
     { UNIT_HOOD, UNIT_HOOD, "24397-60003 test hood", "HOOD", NULL },
@@ -147,6 +156,7 @@ static void start_tx (ASI_CARD *card, UNIT *unit, HP_WORD value)
 }
 static void serial_reset (ASI_CARD *card, uint32 diagnose)
 {
+    card->status_match = card->reply_pos = card->reply_count = 0;
     card->control = card->status_word = 0;
     card->rx_wait = card->tx_wait = card->rx_ready = 0;
     card->uart_diag = diagnose;
@@ -300,7 +310,7 @@ static void uart_dma (ASI_CARD *card, UNIT *unit, DEVICE *device)
     input = (chip->reg[021] & 0200) != 0;
     packed = (chip->reg[021] & 020000) != 0;
     if (input ? !card->rx_ready : card->tx_wait) return;
-    if (!chip->reg[023]) {
+    if (!chip->reg[023] && chip->count_started) {
         chip->flags |= 2;
         l_iop_complete(chip, device);
         card->dma_byte = 0;
@@ -311,16 +321,16 @@ static void uart_dma (ASI_CARD *card, UNIT *unit, DEVICE *device)
         value = card->rx;
         terminate = special_character(card);
         if (packed) {
-            word = mem_read(device, DMA_Channel_1, address);
+            word = mem_l_dma_read(device, address, chip->reg[021], chip->diagnose_mode == 3);
             value = card->dma_byte ? (word & 0177400) | (value & 0377)
                                    : ((value & 0377) << 8) | (word & 0377);
         }
-        mem_write(device, DMA_Channel_1, address, value);
+        mem_l_dma_write(device, address, value, chip->reg[021], chip->diagnose_mode == 3);
         card->rx_ready = 0;
     }
     else {
-        value = mem_read(device, DMA_Channel_1, address);
-        if (cpu_l_dma_parity_error(address, value)) {
+        value = mem_l_dma_read(device, address, chip->reg[021], chip->diagnose_mode == 3);
+        if (cpu_l_dma_parity_error(cpu_l_dma_address(address, chip->reg[021], chip->diagnose_mode == 3), value)) {
             chip->dma_enabled = chip->self_configured = FALSE;
             l_iop_flag(chip, 022, TRUE);
             return;
@@ -332,6 +342,7 @@ static void uart_dma (ASI_CARD *card, UNIT *unit, DEVICE *device)
     if (!packed || card->dma_byte) chip->reg[022] = (address + 1) & 077777;
     if (packed) card->dma_byte ^= 1;
     chip->reg[023] = (chip->reg[023] + 1) & 0177777;
+    chip->count_started = TRUE;
     /* An unchained transmit remains busy until the UART consumes its last
        frame; chained transfers must reconfigure while that frame is active. */
     if ((!chip->reg[023] || terminate)
@@ -345,11 +356,18 @@ static void uart_dma (ASI_CARD *card, UNIT *unit, DEVICE *device)
 }
 static t_stat asi_service (UNIT *unit)
 {
+    /* HP 02645-90005, section 6: ESC backslash + seven status bytes + CR.
+       4KB memory; line mode, block mode and auto-LF off. This implements
+       the primary-status exchange only, not a terminal screen emulator. */
+    static const unsigned char status_reply[] = "\033\\4001468\r";
     t_stat result;
     unsigned index = (unsigned)(unit - asi_units);
     ASI_CARD *card = &cards[index];
     DEVICE *device = card_device(index);
     if (!card_active(index)) return SCPE_OK;
+    if (!(unit->flags & UNIT_LOCALSTATUS) || card->uart_diag
+      || (unit->flags & (UNIT_LOOPBACK | UNIT_HOOD)))
+        card->status_match = card->reply_pos = card->reply_count = 0;
     l_iop_diagnose_step(&card->chip, device);
     if (card->tx_wait && !((unit->flags & UNIT_HOOD) && (card->control & 04000))
       && cpu_l_io_time() >= card->tx_due) {
@@ -360,16 +378,36 @@ static t_stat asi_service (UNIT *unit)
                 if (!card->break_low) l_iop_flag(&card->chip, 030, TRUE);
             }
         }
+        else if ((unit->flags & UNIT_LOCALACK) && card->tx == 005) {
+            /* Terminal-side convenience, as in hp3000_atc.c: absorb ENQ
+               and receive ACK through the normal UART/PIO/DMA path.
+               Physical loopback and diagnostic wiring take precedence. */
+            receive_byte(card, 006);
+            card->status_match = 0;
+        }
         else {
-            if (index == 0) {
+            t_bool local_status = (unit->flags & UNIT_LOCALSTATUS)
+                              && card->status_match == 2 && card->tx == 021;
+            if (index == 0 && !local_status) {
                 result = sim_putchar_s(card->tx);
                 if (result == SCPE_STALL) { sim_activate(unit, 100); return SCPE_OK; }
                 if (result != SCPE_OK) return result;
             }
-            if (unit->flags & UNIT_ATT) {
+            if ((unit->flags & UNIT_ATT) && !local_status) {
                 if (fputc(card->tx, unit->fileref) == EOF) return SCPE_IOERR;
                 unit->pos++; fflush(unit->fileref);
             }
+            if (local_status) {
+                card->reply_pos = 0;
+                card->reply_count = sizeof status_reply - 1;
+                card->reply_due = cpu_l_io_time() + character_ticks(card);
+            }
+            /* Observe successfully transmitted characters. The final DC1
+               is absorbed locally; other escape sequences pass unchanged. */
+            if (unit->flags & UNIT_LOCALSTATUS)
+                card->status_match = card->tx == 033 ? 1
+                    : card->status_match == 1 && card->tx == '^' ? 2 : 0;
+            else card->status_match = 0;
         }
         card->tx_wait = 0;
         /* At terminal count the last TRE is the N+1 service request. No
@@ -378,6 +416,13 @@ static t_stat asi_service (UNIT *unit)
         if (!card->break_low && (!card->chip.dma_enabled
           || (!(card->chip.reg[021] & 0200) && !card->chip.reg[023])))
             l_iop_flag(&card->chip, 030, TRUE);
+    }
+    if (card->reply_count && (unit->flags & UNIT_LOCALSTATUS)
+      && !card->uart_diag && !(unit->flags & (UNIT_LOOPBACK | UNIT_HOOD))
+      && !card->rx_ready && cpu_l_io_time() >= card->reply_due) {
+        receive_byte(card, status_reply[card->reply_pos++]);
+        card->reply_count--;
+        card->reply_due = cpu_l_io_time() + character_ticks(card);
     }
     uart_dma(card, unit, device);
     if (card->rx_wait && card->rx_ready) {
@@ -396,6 +441,8 @@ static t_stat asi_service (UNIT *unit)
         double remaining = card->tx_due - cpu_l_io_time();
         sim_activate(unit, remaining > 128 ? (int32)(remaining / 128) : 1);
     }
+    else if (card->reply_count && (unit->flags & UNIT_LOCALSTATUS))
+        sim_activate(unit, (character_ticks(card) + 127) / 128);
     return SCPE_OK;
 }
 t_stat l_asi_poll (void)

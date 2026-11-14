@@ -15,7 +15,10 @@ void l_iop_flag (L_IOP *chip, uint32 reg, t_bool set)
     uint32 bit = reg == 023 ? 7u : flag_bit(reg);
     if (!set && reg == 020) bit = 3;
     if (set) { chip->flags |= bit; chip->irq_pending = TRUE; }
-    else chip->flags &= ~bit;
+    else {
+        chip->flags &= ~bit;
+        if (!chip->flags) chip->irq_pending = FALSE;
+    }
 }
 t_bool l_iop_irq (const L_IOP *chip)
 {
@@ -60,9 +63,9 @@ uint32 l_iop_io (L_IOP *chip, uint32 reg, uint32 op, t_bool clear,
     }
     if (op == 7) {
         chip->controls |= bit;
-        if (chip->flags & bit) chip->irq_pending = TRUE;
+        if ((chip->flags & bit) && !clear) chip->irq_pending = TRUE;
         if (reg == 020) action = L_IOP_CONFIG;
-        if (reg == 021) { chip->dma_enabled = TRUE; chip->self_configured = FALSE; chip->dma_wait = 1; }
+        if (reg == 021) { chip->dma_enabled = TRUE; chip->self_configured = FALSE; chip->dma_wait = 1; chip->count_started = FALSE; }
         if (reg == 030) action = L_IOP_START;
     }
     if (clear) l_iop_flag(chip, reg, FALSE);
@@ -75,10 +78,14 @@ static void parity_abort (L_IOP *chip)
 }
 static t_bool config_word (L_IOP *chip, DEVICE *device, HP_WORD *value)
 {
-    HP_WORD address = chip->reg[020] & 077777;
-    *value = mem_read(device, DMA_Channel_1, address);
+    /* Capture this cycle's selector before loading CW1 changes it. The
+       following configuration fetches use the newly loaded selector when
+       STC13,C masks SC5 (24397-18004, lines 8260..8383). Parity must be
+       checked at the address actually read, not at the new bank. */
+    HP_WORD address = chip->reg[020] & 077777, control = chip->reg[021];
+    *value = mem_l_dma_read(device, address, control, TRUE);
     chip->reg[020] = (address + 1) & 077777;
-    if (cpu_l_dma_parity_error(address, *value)) {
+    if (cpu_l_dma_parity_error(cpu_l_dma_address(address, control, TRUE), *value)) {
         parity_abort(chip);
         return FALSE;
     }
@@ -96,7 +103,7 @@ void l_iop_configure (L_IOP *chip, DEVICE *device)
     chip->reg[022] = value & 077777;
     if (!config_word(chip, device, &chip->reg[023])) return;
     chip->dma_enabled = chip->self_configured = TRUE;
-    chip->dma_wait = 1;
+    chip->dma_wait = 1; chip->count_started = FALSE;
     chip->auto_pending = (chip->reg[021] & 0600) == 0400;
 }
 /* 02103-90005 section 2-23: CLC22 aborts without an interrupt and
@@ -112,7 +119,7 @@ void l_iop_complete (L_IOP *chip, DEVICE *device)
     uint32 flag = chip->self_configured ? 020 : 021;
     chip->dma_enabled = FALSE;
     if (chip->self_configured && (chip->reg[021] & 010000))
-        mem_write(device, DMA_Channel_1, (chip->reg[020] - 1) & 077777, chip->reg[023]);
+        mem_l_dma_write(device, (chip->reg[020] - 1) & 077777, chip->reg[023], chip->reg[021], TRUE);
     if (chip->self_configured && (chip->reg[021] & 0100000))
         l_iop_configure(chip, device);
     else {
@@ -131,20 +138,21 @@ void l_iop_diagnose (L_IOP *chip, uint32 mode, DEVICE *device)
     if (chip->srq_mask && chip->dma_enabled) {
         uint32 budget = 65536;
         while (chip->dma_enabled && budget--) {
-            if (!chip->reg[023]) { l_iop_complete(chip, device); continue; }
+            if (!chip->reg[023] && chip->count_started) { l_iop_complete(chip, device); continue; }
             if (!chip->auto_pending) break;
             {
                 HP_WORD address = chip->reg[022] & 077777;
-                chip->reg[030] = mem_read(device, DMA_Channel_1, address);
+                chip->reg[030] = mem_l_dma_read(device, address, chip->reg[021], chip->diagnose_mode == 3);
                 chip->auto_pending = FALSE;
                 chip->reg[022] = (address + 1) & 077777;
                 chip->reg[023] = (chip->reg[023] + 1) & 0177777;
-                if (cpu_l_dma_parity_error(address, chip->reg[030])) {
+                chip->count_started = TRUE;
+                if (cpu_l_dma_parity_error(cpu_l_dma_address(address, chip->reg[021], chip->diagnose_mode == 3), chip->reg[030])) {
                     parity_abort(chip);
                     break;
                 }
             }
-            if (!chip->reg[023]) l_iop_complete(chip, device);
+            if (!chip->reg[023] && chip->count_started) l_iop_complete(chip, device);
         }
     }
 }
@@ -160,15 +168,20 @@ t_bool l_iop_diagnose_step (L_IOP *chip, DEVICE *device)
        32 memory cycles (02103-90005 section 2-17). Instruction-event
        pacing is a functional approximation, not a microcycle model. */
     while (l_iop_diagnose_pending(chip) && words < 32) {
-        if (chip->reg[023]) {
-            mem_write(device, DMA_Channel_1, chip->reg[022] & 077777, chip->reg[020]);
+        if (chip->reg[023] || !chip->count_started) {
+            mem_l_dma_write(device, chip->reg[022] & 077777, chip->reg[020], chip->reg[021], TRUE);
             chip->reg[020] = (chip->reg[020] + 1) & 077777;
             chip->reg[022] = (chip->reg[022] + 1) & 077777;
             chip->reg[023] = (chip->reg[023] + 1) & 0177777;
+            chip->count_started = TRUE;
             words++;
         }
-        if (!chip->reg[023]) l_iop_complete(chip, device);
+        if (!chip->reg[023] && chip->count_started) l_iop_complete(chip, device);
     }
-    chip->dma_wait = words ? words : 1;
+    /* sim_activate delays count CPU instructions, not memory cycles.
+       Yield a processor opportunity between bounded backplane grants;
+       delaying 32 instructions per grant incorrectly throttles DMA to
+       one word per CPU instruction. */
+    chip->dma_wait = words ? (words * 3 + 3) / 4 : 1;
     return l_iop_diagnose_pending(chip);
 }

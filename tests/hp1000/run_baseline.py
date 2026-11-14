@@ -16,7 +16,7 @@ MODELS = ("2116", "2115", "2114", "2100", "1000-M", "1000-E", "1000-F")
 def execute(simulator, script, output, timeout):
     try:
         result = subprocess.run([str(simulator), str(script.resolve())],
-                                input="", text=True, stdout=subprocess.PIPE,
+                                input="", text=True, errors="replace", stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=timeout)
         output.write_text(result.stdout)
         passed = result.returncode == 0 and "HP1000_CHECK_PASS" in result.stdout

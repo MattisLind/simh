@@ -17,6 +17,8 @@ UNIT l_amigo_units[] = {
     { UDATA(&l_hpi_service, 0, 0) }
 };
 L_AMIGO_STATE l_amigo_state;
+/* Bit zero remains the public active flag; bit one selects one-sector I/O. */
+enum { STREAM_TRANSFER = 1, BUFFERED_TRANSFER = 3 };
 static void poll (t_bool enabled) { di_poll_response(lh, 0, enabled ? SET : CLEAR); }
 void l_amigo_reset (void)
 {
@@ -84,8 +86,17 @@ static void command (void)
         case 4:
             fd->reply[0] = fd->cylinder[fd->selected] >> 8; fd->reply[1] = fd->cylinder[fd->selected];
             fd->reply[2] = fd->head[fd->selected]; fd->reply[3] = fd->sector[fd->selected]; fd->reply_count = 4; fd->reply_pos = 0; break;
-        case 5: fd->read_active = 1; fd->write_active = 0; break;
-        case 8: fd->write_active = 1; fd->read_active = 0; fd->offset = 0; break;
+        case 5:
+            /* 07902-90030 A-29..32: secondary 0Ah preloads one sector
+               and raises parallel poll; 08h streams sectors on demand. */
+            fd->read_active = fd->secondary == 012 ? BUFFERED_TRANSFER : STREAM_TRANSFER;
+            fd->write_active = 0;
+            if (fd->read_active == BUFFERED_TRANSFER) disk_read();
+            break;
+        case 8:
+            fd->write_active = fd->secondary == 011 ? BUFFERED_TRANSFER : STREAM_TRANSFER;
+            fd->read_active = 0; fd->offset = 0;
+            break;
         case 10: fd->read_active = fd->write_active = 0; break;
         case 15: break; /* file mask, no fd->cylinder-limited hard-disc extent */
         default: fd->disk_status[fd->selected] = 012; fd->dsj = 1; break;
@@ -102,10 +113,16 @@ t_bool l_amigo_accept (uint32 unit, uint8 data)
         if ((data & 0140) == 040) { if ((data & 037) == address) di[lh].listeners = 1; return TRUE; }
         if ((data & 0140) == 0100) {
             fd->untalk = data == 0137;
-            if (fd->untalk && fd->secondary == 036) poll(TRUE);
+            if (fd->untalk && (fd->secondary == 036 || fd->read_active == BUFFERED_TRANSFER)) poll(TRUE);
             di[lh].talker = ((data & 037) == address) ? 1 : 0; return TRUE;
         }
         if (data == 024 || (data == 4 && di[lh].listeners)) {
+            /* 07902-90030 A-20: clear Stat 1 and recalibrate both drives.
+               A later ROM callback must not inherit an old command error. */
+            memset(fd->disk_status, 0, sizeof fd->disk_status);
+            memset(fd->cylinder, 0, sizeof fd->cylinder);
+            memset(fd->head, 0, sizeof fd->head);
+            memset(fd->sector, 0, sizeof fd->sector);
             fd->read_active = fd->write_active = 0; fd->packet_count = fd->reply_count = fd->reply_pos = 0; fd->dsj = 0; poll(TRUE); return TRUE;
         }
         if ((data & 0140) == 0140) {
@@ -116,7 +133,10 @@ t_bool l_amigo_accept (uint32 unit, uint8 data)
             }
             else if (di[lh].talker) {
                 if (fd->secondary == 020) { fd->reply[0] = fd->dsj; fd->reply_count = 1; fd->reply_pos = 0; }
-                if (fd->secondary == 0 && fd->read_active) disk_read();
+                if (fd->secondary == 0 && fd->read_active) {
+                    if (fd->read_active == STREAM_TRANSFER) disk_read();
+                    else poll(FALSE);
+                }
                 if (fd->secondary == 036) {
                     memcpy(fd->reply, fd->loopback, sizeof fd->reply);
                     fd->reply_count = sizeof fd->reply; fd->reply_pos = 0;
@@ -124,8 +144,10 @@ t_bool l_amigo_accept (uint32 unit, uint8 data)
                 if (fd->secondary == 037) { fd->reply[0] = 0; fd->reply_count = 1; fd->reply_pos = 0; }
             }
             else if (di[lh].listeners) {
-                if (fd->secondary == 010) fd->packet_count = 0;
+                if (fd->secondary == 010 || fd->secondary == 011 || fd->secondary == 012)
+                    fd->packet_count = 0;
                 if (fd->secondary == 036) fd->loopback_count = 0;
+                if (fd->secondary == 0 && fd->write_active) poll(FALSE);
             }
             return TRUE;
         }
@@ -139,7 +161,7 @@ t_bool l_amigo_accept (uint32 unit, uint8 data)
         if ((di[lh].bus_cntl & BUS_EOI) || fd->loopback_count == sizeof fd->loopback) poll(TRUE);
         return TRUE;
     }
-    if (fd->secondary == 010) {
+    if (fd->secondary == 010 || fd->secondary == 011 || fd->secondary == 012) {
         if (fd->packet_count < 16) fd->packet[fd->packet_count++] = data;
         if (di[lh].bus_cntl & BUS_EOI) command();
         return TRUE;
@@ -151,10 +173,13 @@ t_bool l_amigo_accept (uint32 unit, uint8 data)
           || fd->head[fd->selected] >= 2
           || fd->sector[fd->selected] >= 30) { fd->dsj = 1; return TRUE; }
         fd->reply[fd->offset++] = data;
-        if (fd->offset == 256) {
+        /* A-38..41: EOI commits a short sector, retaining the rest of
+           the controller buffer, for both buffered and streaming writes. */
+        if (fd->offset == 256 || (di[lh].bus_cntl & BUS_EOI)) {
             t_addr position = ((fd->cylinder[fd->selected] * 2 + fd->head[fd->selected]) * 30 + fd->sector[fd->selected]) * 256;
             if (sim_fseek(drive->fileref, position, SEEK_SET) || sim_fwrite(fd->reply, 1, 256, drive->fileref) != 256) fd->dsj = 1;
             fd->offset = 0; advance();
+            if (fd->write_active == BUFFERED_TRANSFER) { fd->write_active = 0; poll(TRUE); }
         }
         if (di[lh].bus_cntl & BUS_EOI) { fd->write_active = 0; poll(TRUE); }
     }
@@ -178,7 +203,14 @@ static t_stat floppy_service (UNIT *unit)
     (void)unit;
     while (budget-- && di[lh].talker && !(di[lh].bus_cntl & (BUS_ATN | BUS_NRFD))) {
         if (fd->reply_pos == fd->reply_count) {
-            if (fd->secondary != 0 || !fd->read_active || !disk_read()) break;
+            if (fd->secondary != 0 || !fd->read_active) break;
+            if (fd->read_active == BUFFERED_TRANSFER) {
+                /* A-30: overreading a buffered sector returns a dummy
+                   byte tagged with EOI, never the following disk sector. */
+                fd->reply[0] = 1; fd->reply_count = 1; fd->reply_pos = 0;
+                fd->read_active = 0;
+            }
+            else if (!disk_read()) break;
         }
         /* Identify and status/loopback replies are records even if a prior
            streaming disk read remains armed. Only disk data suppresses EOI. */
@@ -189,6 +221,7 @@ static t_stat floppy_service (UNIT *unit)
         }
         if (!di_bus_source(lh, fd->reply[fd->reply_pos])) break;
         fd->reply_pos++;
+        if (fd->reply_pos == fd->reply_count && fd->read_active == BUFFERED_TRANSFER) poll(TRUE);
         if (fd->reply_pos == fd->reply_count && fd->identified) { fd->identified = 0; break; }
     }
     return SCPE_OK;

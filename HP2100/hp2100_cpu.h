@@ -559,6 +559,11 @@ extern HP_WORD SPR;                             /* Stack Pointer Register (F-reg
 
 /* L-Series processor ROM overlay (HP 02103-90009, Appendix A). */
 
+extern t_bool cpu_l_xl_present (void), cpu_l_map_physical (t_bool alternate);
+extern void cpu_l_map_reset (void), cpu_l_map_write (uint32 address, HP_WORD value, t_bool physical);
+extern uint32 cpu_l_map_address (HP_WORD address, t_bool alternate);
+extern uint32 cpu_l_dma_address (HP_WORD address, HP_WORD control, t_bool self_configure);
+extern t_bool cpu_l_dma_maps (HP_WORD control, t_bool self_configure);
 extern double cpu_l_io_time (void);
 extern t_bool l_asi_active (void);
 extern t_bool l_asi_any_active (void);

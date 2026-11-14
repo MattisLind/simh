@@ -850,7 +850,9 @@ switch (classification) {                               /* dispatch on the acces
         break;
     }                                                   /* all cases are handled */
 
-index = map_address (address, map, protection);         /* translate the logical address to a physical address */
+index = (cpu_configuration & CPU_1000_L)
+    ? (classification >= DMA_Channel_1 ? address : cpu_l_map_address (address, classification == Data_Alternate))
+    : map_address (address, map, protection);         /* translate the logical address to a physical address */
 
 /* L-Series nonexistent memory reads return all ones, unlike M/E/F.
    HP 02103-90007, October 1980, section 3-7, printed page 3-3. */
@@ -993,7 +995,9 @@ switch (classification) {                               /* dispatch on the acces
 
     }                                                   /* all cases are handled */
 
-index = map_address (address, map, protection);         /* translate the logical address to a physical address */
+index = (cpu_configuration & CPU_1000_L)
+    ? (classification >= DMA_Channel_1 ? address : cpu_l_map_address (address, classification == Data_Alternate))
+    : map_address (address, map, protection);         /* translate the logical address to a physical address */
 
 if (protection == WRITE_PROTECTED                       /* if protection is wanted */
   && address >= 2 && address < mp_fence)                /*   and the MP check fails */
@@ -1005,6 +1009,9 @@ if (index <= 1 && map <= User_Map)                      /* if the A/B register i
 else if (index < mem_end)                               /* otherwise if the location is within defined memory */
     { M [index] = (MEMORY_WORD) value;                  /*   then write the value to memory */
       cpu_l_parity_write (index, value, FALSE);
+      if (cpu_configuration & CPU_1000_L)
+          cpu_l_map_write (address, value, classification >= DMA_Channel_1
+                           || cpu_l_map_physical (classification == Data_Alternate));
     }
 
 TR = value;                                             /* save the value just written */
@@ -1113,6 +1120,32 @@ return mem_examine (map_address (address, map, NO_PROTECTION)); /* return the va
 }
 
 
+/* L IOP data cycles carry a separate relocation selector. Configuration
+   and residue cycles assert SC5; none pass through the CPU logical map. */
+HP_WORD mem_l_dma_read (DEVICE *device, HP_WORD address, HP_WORD control, t_bool self_configure)
+{
+uint32 physical = cpu_l_dma_address (address, control, self_configure);
+HP_WORD value = physical < mem_size ? (HP_WORD) M[physical] : D16_MASK;
+(void)device;
+if (cpu_l_xl_present ())
+    tprintf (cpu_dev, TRACE_IOBUS, "XL DMA %s read %05o -> %06o CW=%06o SC5=%u data=%06o\n",
+             device->name, address, physical, control, self_configure, value);
+return value;
+}
+void mem_l_dma_write (DEVICE *device, HP_WORD address, HP_WORD value, HP_WORD control, t_bool self_configure)
+{
+uint32 physical = cpu_l_dma_address (address, control, self_configure);
+(void)device;
+if (cpu_l_xl_present ())
+    tprintf (cpu_dev, TRACE_IOBUS, "XL DMA %s write %05o -> %06o CW=%06o SC5=%u data=%06o\n",
+             device->name, address, physical, control, self_configure, value);
+if (physical < mem_size) {
+    M[physical] = value;
+    cpu_l_parity_write (physical, value, FALSE);
+    cpu_l_map_write (address, value, cpu_l_dma_maps (control, self_configure));
+    }
+}
+
 /* Zero a range of memory locations.
 
    Main memory locations from a supplied starting address through the end of
@@ -1127,7 +1160,7 @@ memset (M + starting_address, 0,                        /* zero the words */
         fill_count * sizeof (MEMORY_WORD));             /*   in the specified memory range */
 if (cpu_configuration & CPU_1000_L) {
     uint32 address;
-    for (address = starting_address; address < starting_address + fill_count && address < 32768; address++)
+    for (address = starting_address; address < starting_address + fill_count && address < 262144; address++)
         cpu_l_parity_write (address, 0, TRUE);
     }
 
@@ -1326,7 +1359,8 @@ if (address <= 1 && !(sim_switches & SIM_SW_REST))      /* if the address is 0 o
 else if (address < mem_end)                             /* otherwise if the address is within defined memory */
     { M [address] = (MEMORY_WORD) value & DV_MASK;      /*   then store the value */
       if (!(sim_switches & SIM_SW_REST))               /* RESTORE supplies saved parity bits separately */
-          cpu_l_parity_write (address, value, TRUE);
+          { cpu_l_parity_write (address, value, TRUE);
+            cpu_l_map_write (address, value, TRUE); }
     }
 
 return;
